@@ -1,35 +1,25 @@
 #!/bin/bash
-# mesh-config: raspi-config style tool for the classroom Pi mesh.
+# mesh-config: configuration tool for a Raspberry Pi ad-hoc mesh (after the
+# meshunderground.com Raspberry Pi mesh guide).
 #
 #   sudo ./mesh-config.sh            interactive menu
-#   sudo ./mesh-config.sh install    write all system files non-interactively
-#   sudo ./mesh-config.sh status     print status and exit
+#   sudo ./mesh-config.sh install    write all system files
+#   sudo ./mesh-config.sh status     print status
 #
-# Design (after meshunderground.com's Raspberry Pi mesh guide):
-#   - The Pi's built-in radio runs an open ad-hoc (IBSS) cell with batman-adv on
-#     top. Every Pi joins and leaves whenever it likes; batman-adv re-routes.
-#   - An ESP32-C5 (ESP-Hosted) is the uplink radio. Per node it either stays
-#     with NetworkManager and connects to an external network through one of
-#     the user's own saved profiles (eduroam, a home Wi-Fi, PPPoE, anything), or
-#     it broadcasts the shared group access point (one SSID on every AP node, so
-#     laptops roam between Pis). The script never configures external networks.
-#   - Any node that currently has a working internet route outside the mesh
-#     becomes a gateway for the others, and stops being one the moment it drops.
-#   - Every node's web folder is reachable through any node (Caddy proxies).
-#   - The uplink radio can be plugged or unplugged at any time: udev starts its
-#     role when it appears and systemd stops it when it disappears.
+# Design:
+#   mesh radio     built-in Wi-Fi, open ad-hoc (IBSS) cell, batman-adv on top
+#   uplink radio   second Wi-Fi (ESP32-C5, esp-hosted-linux), role per node:
+#                    external  NetworkManager connection; node is a gateway while online
+#                    ap        group access point, same SSID on every AP node
+#   names          dnsmasq + avahi: <id>.mesh, <group>.mesh
+#   web            caddy on every node: /home/<id>/public, other nodes proxied at /<id>/
+#   hot plug       udev starts and stops the uplink role with the radio
+#   failure        checks before any radio is touched; mesh-down.sh runs as
+#                  ExecStopPost, so the mesh radio returns to NetworkManager
 #
-# Everything the node needs lives in /boot/firmware/mesh.conf. This tool edits
-# that file, writes the system files that read it, and starts or stops the mesh.
-# It is safe to run again at any time; every write is idempotent.
+# Settings live in /boot/firmware/mesh.conf. Every write is idempotent.
 #
-# Failure handling: mesh-up.sh checks everything it can before touching a radio,
-# and if it still fails half way systemd runs mesh-down.sh (ExecStopPost), so
-# the built-in radio always goes back to NetworkManager. Every error this tool
-# hits is shown in a scrollable box together with the mesh journal instead of
-# being wiped by the next menu.
-#
-# mesh.conf keys (the menu writes them; an empty value means "derived from the group"):
+# mesh.conf keys (empty value: derived from the group):
 #   id             node name: hostname, DNS name, Linux user and folder /home/<id>/public
 #   group          shared name of this mesh, address <group>.mesh (default: group)
 #   display        optional display name
@@ -42,7 +32,7 @@
 #   ap_channel     auto (36/40/44/48 picked from the id) or a fixed channel
 #   bridge_eth0    yes/no: bridge eth0 into the mesh     usb_gadget   yes/no: USB-C gadget port
 #
-# Files written by install (menu 6):
+# Files written by install (6 Install):
 #   /usr/local/sbin/mesh-{up,down,uplink,role,hosts}.sh and /usr/local/lib/mesh/common.sh
 #   /etc/systemd/system/mesh.service, mesh-uplink@.service, mesh-role-check.{service,timer},
 #     mesh-hosts.{service,timer}, caddy.service.d/mesh.conf
@@ -50,32 +40,31 @@
 #   /etc/NetworkManager/conf.d/99-mesh.conf, /etc/NetworkManager/dispatcher.d/50-mesh-dns
 #   /etc/udev/rules.d/90-mesh-uplink.rules, /etc/avahi/avahi-daemon.conf, /etc/avahi/services/groupmesh.service
 #   /etc/tmpfiles.d/mesh.conf, /etc/sysctl.d/90-mesh.conf, /etc/modules-load.d/batman.conf
-#   /etc/resolv.conf (points at the local dnsmasq; NetworkManager is told not to touch it)
+#   /etc/resolv.conf (local dnsmasq; NetworkManager dns=none)
 # Runtime state: /etc/default/mesh (ID, MYIP, GROUP, MESH_IF, MESH_BSSID), /run/mesh/{up,uplink,gateway,warnings},
-#   /run/dnsmasq/upstream.conf (where dnsmasq forwards to right now), /etc/hosts.mesh (names found via mDNS).
+#   /run/dnsmasq/upstream.conf (dnsmasq forwarders), /etc/hosts.mesh (names found via mDNS).
 
 set -u
 CONF=/boot/firmware/mesh.conf
 [ -d /boot/firmware ] || CONF=/boot/mesh.conf
 SELF=$(readlink -f "$0")
-TITLE="Mesh configuration"
-WARN_FILE=/run/mesh/warnings      # written by the mesh scripts, shown after a start
-INTERACTIVE=0                     # 1 while the whiptail menu is running
+TITLE="Raspberry Pi Mesh Configuration Tool (mesh-config)"
+WARN_FILE=/run/mesh/warnings      # warnings from the mesh scripts
+INTERACTIVE=0                     # 1 inside the menu
 
 [ "$EUID" -eq 0 ] || exec sudo -E "$SELF" "$@"
 
 # ---------------------------------------------------------------- helpers ----
 
-# Fatal error: always on stderr, also as a dialog while the menu is up.
+# Fatal error: stderr, plus a dialog inside the menu.
 die() {
   echo "mesh-config: ERROR: $*" >&2
   [ "$INTERACTIVE" = 1 ] && command -v whiptail >/dev/null 2>&1 && whiptail --title "$TITLE: error" --msgbox "$*" 12 70
   exit 1
 }
 
-# mesh.conf is one key='value' per line and is also sourced by the mesh scripts,
-# so values are stored single-quoted with embedded quotes escaped: nothing a user
-# types can be expanded by the shell, and sed never sees the value itself.
+# mesh.conf: one key='value' per line, sourced by the mesh scripts. Values are
+# stored single-quoted with embedded quotes escaped.
 cfg_get() {
   local v q="'"
   [ -f "$CONF" ] || return 0
@@ -90,7 +79,7 @@ cfg_get() {
 cfg_set() {
   local key=$1 val=$2 q="'"
   val=${val//"$q"/"$q\\$q$q"}
-  { [ -f "$CONF" ] || : > "$CONF"; } 2>/dev/null || die "Cannot create $CONF. Is $(dirname "$CONF") mounted read-write?"
+  { [ -f "$CONF" ] || : > "$CONF"; } 2>/dev/null || die "Cannot create $CONF"
   [ -w "$CONF" ] || die "Cannot write $CONF."
   if grep -q "^$key=" "$CONF"; then
     sed -i "/^$key=/d" "$CONF" || die "Cannot update $CONF."
@@ -99,8 +88,7 @@ cfg_set() {
 }
 # Set a key only when it has no value yet.
 cfg_default() { [ -n "$(cfg_get "$1")" ] || cfg_set "$1" "$2"; }
-# Store a value, or an empty string when it equals the derived default, so the
-# setting keeps following the group name when the group is renamed later.
+# Store a value; store an empty string when it equals the derived default.
 cfg_set_or_follow() { if [ "$2" = "$3" ]; then cfg_set "$1" ""; else cfg_set "$1" "$2"; fi; }
 
 # Names derived from the group when not set explicitly:
@@ -111,11 +99,11 @@ mesh_name()    { local v; v=$(cfg_get mesh_id); echo "${v:-$(group_name).mesh}";
 ap_ssid_name() { local v; v=$(cfg_get ap_ssid); echo "${v:-$(group_name)-mesh}"; }
 ap_psk_value() { local v; v=$(cfg_get ap_psk);  echo "${v:-$(group_name).mesh}"; }
 
-# The menu needs whiptail: install it if missing, otherwise stop with a clear message.
+# Install whiptail when missing.
 ensure_whiptail() {
   command -v whiptail >/dev/null 2>&1 && return 0
   DEBIAN_FRONTEND=noninteractive apt-get install -y whiptail >/dev/null 2>&1
-  command -v whiptail >/dev/null 2>&1 || die "whiptail is missing and could not be installed (offline?). Run: sudo apt-get install whiptail"
+  command -v whiptail >/dev/null 2>&1 || die "whiptail is not installed"
 }
 # Dialog wrappers: message box, text input (with default), password input, yes/no question.
 msg()  { whiptail --title "$TITLE" --msgbox "$1" 12 70; }
@@ -126,16 +114,14 @@ yesno(){ whiptail --title "$TITLE" --yesno "$1" 10 70; }
 # Show a text file: a scrollable dialog in the menu, plain output otherwise.
 show_text() { if [ "$INTERACTIVE" = 1 ]; then whiptail --title "$TITLE: $1" --scrolltext --textbox "$2" 30 100; else cat "$2"; fi; }
 
-# Run a command and keep its output. On failure, show that output together with
-# the recent mesh journal in a scrollable box, so the error is never wiped off
-# the screen by the next menu.
+# Run a command. On failure show its output and the recent mesh journal.
 run_checked() {
   local out rc
   out=$(mktemp)
   "$@" >"$out" 2>&1; rc=$?
   if [ $rc -ne 0 ]; then
     {
-      echo "FAILED (exit $rc): $*"; echo
+      echo "Failed (exit $rc): $*"; echo
       cat "$out"
       echo; echo "---- systemctl status mesh.service ----"
       systemctl status mesh.service --no-pager -l 2>&1 | head -25
@@ -149,8 +135,7 @@ run_checked() {
   return $rc
 }
 
-# Wi-Fi interfaces present right now, with their drivers (for menu texts), and
-# the ones that could carry the uplink role (anything but the built-in brcmfmac).
+# Wi-Fi interfaces with their drivers.
 wifi_ifaces() {
   local d
   for d in /sys/class/net/*; do
@@ -158,7 +143,7 @@ wifi_ifaces() {
     printf '%s(%s) ' "$(basename "$d")" "$(basename "$(readlink -f "$d/device/driver" 2>/dev/null)")"
   done
 }
-# Interfaces that could carry the uplink role: every Wi-Fi interface except the built-in radio.
+# Wi-Fi interfaces other than the built-in radio.
 uplink_candidates() {
   local d
   for d in /sys/class/net/*; do
@@ -167,18 +152,17 @@ uplink_candidates() {
   done
 }
 
-# Are the system files in place? Is the mesh running right now? Does it start at boot?
+# System files installed? Mesh active? Mesh enabled at boot?
 installed() { [ -x /usr/local/sbin/mesh-up.sh ] && [ -f /etc/systemd/system/mesh.service ] && [ -f /usr/local/lib/mesh/common.sh ] && [ -x /usr/local/sbin/mesh-uplink.sh ]; }
 mesh_active() { systemctl is-active --quiet mesh.service; }
 mesh_enabled() { systemctl is-enabled --quiet mesh.service 2>/dev/null; }
 
-# Fill mesh.conf with defaults for anything unset, after migrating keys from earlier layouts.
+# Defaults for unset keys; migration from earlier layouts.
 set_defaults() {
-  # One-time carry-over from earlier layouts of mesh.conf.
   if [ -z "$(cfg_get group)" ] && [ -n "$(cfg_get course)" ]; then cfg_set group "$(cfg_get course)"; fi
-  [ "$(cfg_get mesh_id)" = watiam-mesh ] && cfg_set mesh_id ""      # now follows the group: <group>.mesh
-  [ "$(cfg_get ap_psk)" = watiam-mesh ]  && cfg_set ap_psk ""       # now follows the group: <group>.mesh
-  [ "$(cfg_get uplink)" = eduroam ]      && cfg_set uplink external # external networks are NetworkManager's job now
+  [ "$(cfg_get mesh_id)" = watiam-mesh ] && cfg_set mesh_id ""
+  [ "$(cfg_get ap_psk)" = watiam-mesh ]  && cfg_set ap_psk ""
+  [ "$(cfg_get uplink)" = eduroam ]      && cfg_set uplink external
   cfg_default group      group
   cfg_default mesh_if    auto
   cfg_default uplink_if  auto
@@ -194,46 +178,43 @@ set_defaults() {
 # ------------------------------------------------------------ system files ----
 
 write_system_files() (
-  # Runs in a subshell with "exit on error": any failed write stops the install
-  # and names the failing line instead of silently carrying on. Call it plainly
-  # and check $? afterwards; "write_system_files || ..." would switch set -e off.
+  # Subshell with set -e: the first failed write aborts the install. Call it
+  # plainly and test $? ("write_system_files || ..." disables set -e inside).
   set -eE
-  trap 'echo "mesh-config: install FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
+  trap 'echo "mesh-config: install failed at line $LINENO: $BASH_COMMAND" >&2' ERR
   trap 'systemctl unmask hostapd >/dev/null 2>&1 || true' EXIT
   fail() { echo "mesh-config: ERROR: $*" >&2; exit 1; }
 
   systemctl is-active --quiet NetworkManager \
-    || fail "NetworkManager is not running. This tool needs it to own the radios while the mesh is off and to reach external networks (Raspberry Pi OS Bookworm or newer)."
-  [ -f "$CONF" ] || : > "$CONF" || fail "cannot create $CONF (is $(dirname "$CONF") mounted read-write?)"
+    || fail "NetworkManager is not running"
+  [ -f "$CONF" ] || : > "$CONF" || fail "cannot create $CONF"
 
   echo "Installing packages..."
-  # Keep hostapd from starting with its stock config the moment it is installed;
-  # the mesh scripts start it with our config when needed.
+  # hostapd must not start with its stock config on installation.
   systemctl mask hostapd >/dev/null 2>&1 || true
   if ! DEBIAN_FRONTEND=noninteractive apt-get install -y batctl hostapd dnsmasq avahi-daemon avahi-utils \
          nftables curl iw bridge-utils whiptail >/dev/null; then
-    echo "WARNING: apt-get install failed (offline?). Checking what is already installed..." >&2
+    echo "WARNING: apt-get install failed" >&2
     missing=""
     for b in batctl hostapd dnsmasq avahi-daemon nft iw; do
       command -v "$b" >/dev/null 2>&1 || missing="$missing $b"
     done
-    [ -z "$missing" ] || fail "required programs are missing:$missing. Connect to the internet and retry."
+    [ -z "$missing" ] || fail "not installed:$missing"
   fi
   if ! command -v caddy >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y caddy >/dev/null 2>&1 || echo "WARNING: caddy not in apt; install it from caddyserver.com" >&2
+    DEBIAN_FRONTEND=noninteractive apt-get install -y caddy >/dev/null 2>&1 || echo "WARNING: caddy is not installed" >&2
   fi
   systemctl unmask hostapd >/dev/null 2>&1 || true
 
   install -d /etc/mesh /usr/local/lib/mesh /etc/nftables.d /etc/dnsmasq.d /etc/avahi/services /etc/hostapd \
              /etc/systemd/system/caddy.service.d /etc/NetworkManager/conf.d /etc/NetworkManager/dispatcher.d \
              /etc/udev/rules.d /etc/tmpfiles.d /var/www/mesh /usr/local/sbin /run/mesh /run/dnsmasq
-  # Leftovers from earlier layouts (the template in dnsmasq.d made dnsmasq refuse to start;
-  # eduroam/dhcpcd handling moved to NetworkManager).
+  # Files from earlier layouts.
   rm -f /etc/dnsmasq.d/mesh.conf.tpl /etc/hostapd/hostapd.conf.tpl /etc/wpa_supplicant/wpa_supplicant-wlan1.conf.tpl \
         /etc/wpa_supplicant/wpa_supplicant-wlan0.conf /etc/mesh/wpa_supplicant-uplink.conf.tpl /etc/mesh/dhcpcd.conf.tpl \
         /etc/systemd/system/mesh-role.service /etc/systemd/system/mesh-role@.service /etc/avahi/services/watiam.service
 
-  # --- runtime directories must survive a reboot (/run is a tmpfs)
+  # --- runtime directories
   cat > /etc/tmpfiles.d/mesh.conf <<'EOF'
 d /run/mesh 0755 root root -
 d /run/dnsmasq 0755 root root -
@@ -253,8 +234,7 @@ TPL=/etc/mesh
 # Source mesh.conf when present and derive GROUP (defaults to "group").
 load_conf() { [ -f "$CONF" ] && . "$CONF"; GROUP=${group:-group}; return 0; }
 
-# render TEMPLATE DEST KEY=VALUE...  Literal replacement of @KEY@ tags; sed would
-# trip over / & \ in passphrases.
+# render TEMPLATE DEST KEY=VALUE...  Literal replacement of @KEY@ tags.
 render() {
   local tpl dest kv
   tpl=$(cat "$1") || return 1
@@ -263,8 +243,7 @@ render() {
   printf '%s\n' "$tpl" > "$dest"
 }
 
-# The Pi's built-in radio (brcmfmac), whatever name it got this boot. Names are
-# not stable once a second radio is attached: whichever driver probes first is wlan0.
+# The built-in radio (brcmfmac). Interface names change with a second radio present.
 detect_mesh_if() {
   local d
   for d in /sys/class/net/*; do
@@ -274,7 +253,7 @@ detect_mesh_if() {
   [ -e /sys/class/net/wlan0 ] && { echo wlan0; return 0; }
   return 1
 }
-# First Wi-Fi interface that is not the mesh radio ($1): the ESP32-C5, usually wlan1.
+# First Wi-Fi interface other than the mesh radio ($1).
 detect_uplink_if() {
   local d n
   for d in /sys/class/net/*; do
@@ -288,8 +267,7 @@ detect_uplink_if() {
 resolve_mesh_if()   { case ${mesh_if:-auto}   in auto) detect_mesh_if ;;        *) echo "$mesh_if" ;;   esac; }
 resolve_uplink_if() { case ${uplink_if:-auto} in auto) detect_uplink_if "$1" ;; *) echo "$uplink_if" ;; esac; }
 
-# Interface carrying the system default route, unless it belongs to the mesh.
-# Whatever NetworkManager connected (ESP32 radio, Ethernet, PPPoE, ...) shows up here.
+# Interface of the default route, unless it belongs to the mesh.
 external_dev() {
   local mif; mif=$(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null)
   ip -4 route show default 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}' \
@@ -297,13 +275,12 @@ external_dev() {
 }
 EOF
 
-  # --- NetworkManager dispatcher: while the mesh is off, dnsmasq forwards to the
-  #     DNS servers NetworkManager currently has; while it is on, every network
-  #     change re-evaluates the gateway role right away.
+  # --- NetworkManager dispatcher: mesh off, dnsmasq forwards to NetworkManager's
+  #     DNS servers; mesh on, every network change re-runs the gateway check.
   cat > /etc/NetworkManager/dispatcher.d/50-mesh-dns <<'EOF'
 #!/bin/bash
-# Called by NetworkManager as "50-mesh-dns IFACE ACTION" and by the mesh scripts
-# as "50-mesh-dns any refresh".
+# NetworkManager runs this as "50-mesh-dns IFACE ACTION"; the mesh scripts as
+# "50-mesh-dns any refresh".
 case "${2:-}" in
   up|down|dhcp4-change|dhcp6-change|connectivity-change|dns-change|reapply|refresh) ;;
   *) exit 0 ;;
@@ -315,22 +292,21 @@ if [ "${2:-}" != refresh ]; then
 fi
 umask 022
 install -d /run/dnsmasq
-# nmcli -g joins several servers as "a | b"; strip the separators and spaces.
+# nmcli -g joins several servers as "a | b".
 nmcli -t -f DEVICE,STATE device status 2>/dev/null | awk -F: '$2=="connected"{print $1}' \
   | while read -r dev; do nmcli -g IP4.DNS device show "$dev" 2>/dev/null; done \
   | tr '|' '\n' | sed 's/[[:space:]]//g; /^$/d; s/^/server=/' | awk '!seen[$0]++' > /run/dnsmasq/upstream.conf.new
 mv -f /run/dnsmasq/upstream.conf.new /run/dnsmasq/upstream.conf
 if pkill -HUP -x dnsmasq 2>/dev/null; then
-  # dnsmasq is running: the resolver must point at it (undo any earlier fallback)
+  # dnsmasq running: resolver points at it
   grep -qx 'nameserver 127.0.0.1' /etc/resolv.conf 2>/dev/null \
     || { rm -f /etc/resolv.conf; printf 'nameserver 127.0.0.1\nsearch mesh\n' > /etc/resolv.conf; }
 else
-  # dnsmasq is NOT running: without this the whole machine would have no DNS.
-  # Point the resolver at NetworkManager's servers directly until dnsmasq is back.
+  # dnsmasq not running: resolver points at NetworkManager's servers
   sed 's/^server=/nameserver /' /run/dnsmasq/upstream.conf > /etc/resolv.conf.new
   if [ -s /etc/resolv.conf.new ]; then
     rm -f /etc/resolv.conf; mv -f /etc/resolv.conf.new /etc/resolv.conf
-    logger -t mesh-dns -p user.err "dnsmasq is not running; /etc/resolv.conf points at NetworkManager's DNS servers directly (systemctl status dnsmasq)"
+    logger -t mesh-dns -p user.err "dnsmasq not running; resolv.conf set to NetworkManager servers"
   else
     rm -f /etc/resolv.conf.new
   fi
@@ -339,10 +315,10 @@ exit 0
 EOF
   chmod 755 /etc/NetworkManager/dispatcher.d/50-mesh-dns
 
-  # --- udev: hot plug of the uplink radio. mesh-uplink@.service is a no-op while
-  #     the mesh is off; the built-in radio (brcmfmac) is excluded.
+  # --- udev: start the uplink role when a Wi-Fi interface other than the
+  #     built-in radio appears (no-op while the mesh is off)
   cat > /etc/udev/rules.d/90-mesh-uplink.rules <<'EOF'
-# Written by mesh-config: start the uplink role when a Wi-Fi interface appears.
+# Written by mesh-config.
 SUBSYSTEM=="net", ACTION=="add", ENV{DEVTYPE}=="wlan", DRIVERS!="brcmfmac", TAG+="systemd", ENV{SYSTEMD_WANTS}+="mesh-uplink@$name.service"
 EOF
   udevadm control --reload >/dev/null 2>&1 || true
@@ -351,8 +327,8 @@ EOF
   printf 'net.ipv4.ip_forward = 1\nnet.ipv4.conf.all.rp_filter = 0\n' > /etc/sysctl.d/90-mesh.conf
   echo batman-adv > /etc/modules-load.d/batman.conf
 
-  # --- templates, rendered by the mesh scripts (@TAG@ replaced). They must NOT
-  #     live in /etc/dnsmasq.d or similar directories that daemons read whole.
+  # --- templates, rendered by the mesh scripts (@TAG@ replaced); kept out of
+  #     /etc/dnsmasq.d, which dnsmasq reads whole
   cat > /etc/mesh/dnsmasq.conf.tpl <<'EOF'
 interface=br0
 bind-dynamic
@@ -368,22 +344,21 @@ servers-file=/run/dnsmasq/upstream.conf
 no-resolv
 cache-size=1000
 EOF
-  # A harmless placeholder so dnsmasq can start before the first mesh-up
+  # placeholder until the first mesh start
   [ -f /etc/dnsmasq.d/mesh.conf ] || printf 'no-resolv\nservers-file=/run/dnsmasq/upstream.conf\n' > /etc/dnsmasq.d/mesh.conf
 
   cat > /etc/mesh/hostapd.conf.tpl <<'EOF'
 interface=@UPLINK_IF@
 bridge=br0
 driver=nl80211
-# Shared by every AP node in the group, so laptops roam between Pis.
+# same SSID on every AP node
 ssid=@AP_SSID@
 country_code=CA
 ieee80211d=1
 hw_mode=a
-# Fixed per node: ESP-Hosted has no automatic channel selection. Non-DFS 5 GHz only.
+# fixed per node (esp-hosted has no automatic channel selection); non-DFS 5 GHz only
 channel=@AP_CHANNEL@
 ieee80211n=1
-# If hostapd refuses to start on the ESP32 (journalctl -u hostapd), try removing ieee80211ac=1.
 ieee80211ac=1
 wmm_enabled=1
 wpa=2
@@ -392,8 +367,7 @@ wpa_passphrase=@AP_PSK@
 rsn_pairwise=CCMP
 EOF
 
-  # --- firewall table used only while this node is a gateway (rendered with the
-  #     interface that actually carries the internet route at that moment)
+  # --- firewall table for gateway nodes (rendered with the uplink interface)
   cat > /etc/mesh/meshgw.nft.tpl <<'EOF'
 table inet meshgw {
   chain forward {
@@ -432,7 +406,7 @@ EOF
 </service-group>
 EOF
 
-  # --- Caddy: every node serves its own folder and proxies /<id>/ to that node
+  # --- caddy
   cat > /etc/caddy/Caddyfile <<'EOF'
 {
   auto_https off
@@ -464,8 +438,7 @@ http://{$GROUP}.mesh, http://{$ID}.mesh, http://{$ID}.local, http://{$MYIP} {
 EOF
   cat > /etc/systemd/system/caddy.service.d/mesh.conf <<'EOF'
 [Unit]
-# Started by mesh-up.sh and stopped with the mesh. PartOf (not Requires) so that
-# enabling or starting caddy can never pull the mesh up by itself.
+# started by mesh-up.sh, stopped with the mesh; PartOf, not Requires
 After=mesh.service
 PartOf=mesh.service
 
@@ -476,50 +449,47 @@ EOF
   # --- scripts
   cat > /usr/local/sbin/mesh-up.sh <<'EOF'
 #!/bin/bash
-# Bring the mesh up. Runs as ExecStart of mesh.service.
-# Any failure stops here with a clear line in the journal; systemd then runs
-# mesh-down.sh (ExecStopPost), so the radio always goes back to NetworkManager.
+# Bring the mesh up (ExecStart of mesh.service). On any failure systemd runs
+# mesh-down.sh (ExecStopPost).
 set -eu
 . /usr/local/lib/mesh/common.sh
 install -d "$RUN"; : > "$WARN"; rm -f "$RUN/up" "$RUN/uplink" "$RUN/gateway"
-# fail: log and abort (systemd then runs mesh-down.sh). warn: log, remember for the menu, carry on.
+# fail: log and abort.  warn: log, record for the status page, continue.
 fail() { echo "mesh-up: ERROR: $*" >&2; logger -t mesh-up -p user.err "ERROR: $*"; exit 1; }
 warn() { echo "mesh-up: WARNING: $*" >&2; logger -t mesh-up -p user.warning "WARNING: $*"; echo "$*" >> "$WARN"; }
 trap 'rc=$?; echo "mesh-up: FAILED (exit $rc) at line $LINENO: $BASH_COMMAND" >&2; logger -t mesh-up -p user.err "FAILED at line $LINENO: $BASH_COMMAND"' ERR
 
-[ -f "$CONF" ] || fail "$CONF not found. Run mesh-config first."
+[ -f "$CONF" ] || fail "$CONF not found"
 load_conf
-ID=${id:-}; [ -n "$ID" ] || fail "id= is missing in $CONF (mesh-config menu 1)."
-[[ $ID =~ ^[a-z0-9]+$ ]]    || fail "id='$ID' must be lowercase letters and digits only."
-[[ $GROUP =~ ^[a-z0-9]+$ ]] || fail "group='$GROUP' must be lowercase letters and digits only."
+ID=${id:-}; [ -n "$ID" ] || fail "id not set in $CONF"
+[[ $ID =~ ^[a-z0-9]+$ ]]    || fail "invalid id '$ID'"
+[[ $GROUP =~ ^[a-z0-9]+$ ]] || fail "invalid group '$GROUP'"
 PFX=${mesh_prefix:-10}
 UPLINK=${uplink:-ap}
 MESH_ID=${mesh_id:-$GROUP.mesh}
 case "${mesh_channel:-6}" in 1) FREQ=2412;; 11) FREQ=2462;; *) FREQ=2437;; esac
-# Same cell id on every Pi with the same mesh name, so the ad-hoc cells merge
-# instead of splitting: a locally administered MAC derived from the name.
+# cell id derived from the mesh name (locally administered MAC)
 BSSID=02:$(printf %s "$MESH_ID" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*/\1:\2:\3:\4:\5/')
 
-# 0. Pre-flight. Everything that can be known in advance is checked here, before
-#    any interface is touched, so a doomed start never costs the connection.
+# 0. Checks, before any interface is touched
 MESH_IF=""
-for _ in $(seq 30); do   # at boot the radio may still be probing
+for _ in $(seq 30); do   # the radio may still be probing at boot
   MESH_IF=$(resolve_mesh_if || true)
   [ -n "$MESH_IF" ] && [ -e "/sys/class/net/$MESH_IF" ] && break
   sleep 0.5
 done
-[ -n "$MESH_IF" ] && [ -e "/sys/class/net/$MESH_IF" ] || fail "no mesh radio found (mesh_if=${mesh_if:-auto}). The mesh needs the Pi's built-in Wi-Fi."
-command -v iw >/dev/null 2>&1 || fail "iw is not installed (mesh-config menu 6)."
+[ -n "$MESH_IF" ] && [ -e "/sys/class/net/$MESH_IF" ] || fail "no mesh radio (mesh_if=${mesh_if:-auto})"
+command -v iw >/dev/null 2>&1 || fail "iw not installed"
 modes=$(iw phy "$(cat "/sys/class/net/$MESH_IF/phy80211/name" 2>/dev/null)" info 2>/dev/null \
         | sed -n '/Supported interface modes:/,/^\t[^\t]/p' || true)
 if [ -n "$modes" ] && ! echo "$modes" | grep -q '\* IBSS'; then
-  fail "$MESH_IF does not support ad-hoc (IBSS) mode (this radio offers:$(echo "$modes" | sed -n 's/^.*\* / /p' | tr -d '\n')). The mesh cannot run on it."
+  fail "$MESH_IF has no IBSS mode (modes:$(echo "$modes" | sed -n 's/^.*\* / /p' | tr -d '\n'))"
 fi
-modprobe batman-adv || fail "kernel module batman-adv is missing (reboot after a kernel update?)."
-command -v batctl >/dev/null 2>&1 || fail "batctl is not installed (mesh-config menu 6)."
-[ -f "$TPL/dnsmasq.conf.tpl" ] || fail "$TPL/dnsmasq.conf.tpl is missing: run mesh-config menu 6 (install) again."
-systemctl is-active --quiet NetworkManager || warn "NetworkManager is not running; the radio cannot be handed back to it when the mesh stops, and no external network can be reached."
-[ -z "${mesh_psk:-}" ] || warn "mesh_psk is set but ignored: the ad-hoc mesh runs open (brcmfmac has no usable IBSS encryption)."
+modprobe batman-adv || fail "batman-adv module not available"
+command -v batctl >/dev/null 2>&1 || fail "batctl not installed"
+[ -f "$TPL/dnsmasq.conf.tpl" ] || fail "$TPL/dnsmasq.conf.tpl not found (run install)"
+systemctl is-active --quiet NetworkManager || warn "NetworkManager not running"
+[ -z "${mesh_psk:-}" ] || warn "mesh_psk ignored: the ad-hoc network is open"
 rfkill unblock wifi 2>/dev/null || true
 
 # 1. Identity
@@ -529,52 +499,45 @@ id -u "$ID" >/dev/null 2>&1 || useradd -m -s /bin/bash "$ID"
 install -d -o "$ID" -g "$ID" -m 755 "/home/$ID/public"
 chmod 755 "/home/$ID"
 
-# 2. Address from the mesh radio's MAC: stable per Pi, and how peers turn a
-#    gateway's batman originator address into its IP.
+# 2. Address from the mesh radio's MAC (peers derive a gateway's address the same way)
 m=$(cat "/sys/class/net/$MESH_IF/address")
 X=$((0x${m:12:2})); Y=$((0x${m:15:2}))
 MYIP="$PFX.$X.$Y.1"; IP_PREFIX="$PFX.$X.$Y"
 
-# 3. Take the mesh radio and the bridged ports away from NetworkManager. From
-#    here on any failure makes systemd run mesh-down.sh, which gives them back.
+# 3. Take the mesh radio and the bridged ports from NetworkManager
 ports=""
 [ "${bridge_eth0:-no}" = yes ] && [ -e /sys/class/net/eth0 ] && ports="eth0" || true
 [ "${usb_gadget:-no}" = yes ] && [ -e /sys/class/net/usb0 ] && ports="$ports usb0" || true
 for d in "$MESH_IF" $ports; do
   nmcli device set "$d" managed no >/dev/null 2>&1 || true
 done
-# NetworkManager reports "unmanaged" at once, but its wpa_supplicant lets go of
-# the radio only a moment later, and on the way out it puts the interface back
-# into managed mode. Touching the radio before that happens makes the ad-hoc
-# join fail with "Operation not supported", so wait for both.
+# wpa_supplicant releases the radio after NetworkManager reports "unmanaged" and
+# resets it to managed mode on release; wait for its control socket to go away.
 for _ in $(seq 30); do
   case "$(nmcli -g GENERAL.STATE device show "$MESH_IF" 2>/dev/null || true)" in
     *unmanaged*|"") [ -e "/run/wpa_supplicant/$MESH_IF" ] || break ;;
   esac
   sleep 0.5
 done
-[ -e "/run/wpa_supplicant/$MESH_IF" ] && warn "wpa_supplicant still holds $MESH_IF after 15 s; trying anyway."
+[ -e "/run/wpa_supplicant/$MESH_IF" ] && warn "wpa_supplicant still holds $MESH_IF"
 sleep 1
 
-# 4. Ad-hoc cell on the mesh radio, batman-adv on top, bridge br0 for everything else
+# 4. Ad-hoc cell, batman-adv, bridge
 for attempt in 1 2 3; do
   ip link set "$MESH_IF" down
-  iw dev "$MESH_IF" set type ibss || fail "$MESH_IF refused ad-hoc (IBSS) mode."
-  # batman-adv prefers 1532 so its header fits without fragmenting. brcmfmac (Pi 4/5)
-  # only allows 1500 and batman-adv then fragments by itself, so this is best-effort.
-  ip link set "$MESH_IF" mtu 1532 2>/dev/null || true
+  iw dev "$MESH_IF" set type ibss || fail "cannot set $MESH_IF to IBSS mode"
+  ip link set "$MESH_IF" mtu 1532 2>/dev/null || true   # brcmfmac allows 1500 at most; batman-adv fragments
   ip link set "$MESH_IF" up
   sleep 0.5
-  # Make sure nothing flipped it back to managed mode behind our back before joining.
   iw dev "$MESH_IF" info 2>/dev/null | grep -q 'type IBSS' && break
-  [ "$attempt" = 3 ] && fail "$MESH_IF keeps falling back out of ad-hoc mode; something else (wpa_supplicant?) still controls it."
-  logger -t mesh-up "$MESH_IF was reset to managed mode by something else; setting ad-hoc again (attempt $attempt)"
+  [ "$attempt" = 3 ] && fail "$MESH_IF does not stay in IBSS mode"
+  logger -t mesh-up "$MESH_IF left IBSS mode, retrying ($attempt)"
 done
 iw dev "$MESH_IF" ibss leave 2>/dev/null || true
 iw dev "$MESH_IF" ibss join "$MESH_ID" "$FREQ" fixed-freq "$BSSID" \
-  || fail "could not join ad-hoc cell '$MESH_ID' ($FREQ MHz, cell $BSSID) on $MESH_IF."
+  || fail "ibss join failed on $MESH_IF ('$MESH_ID', $FREQ MHz, $BSSID)"
 ip link add bat0 type batadv 2>/dev/null || true
-batctl if add "$MESH_IF" 2>/dev/null || batctl if 2>/dev/null | grep -q "^$MESH_IF:" || fail "batctl could not attach $MESH_IF to bat0."
+batctl if add "$MESH_IF" 2>/dev/null || batctl if 2>/dev/null | grep -q "^$MESH_IF:" || fail "batctl if add $MESH_IF failed"
 batctl gw_mode client
 ip link add br0 type bridge 2>/dev/null || true
 ip link set bat0 master br0
@@ -582,56 +545,51 @@ ip link set bat0 up
 ip link set br0 up
 ip addr replace "$MYIP/8" dev br0
 for p in $ports; do
-  { ip link set "$p" master br0 && ip link set "$p" up; } || warn "could not bridge $p into the mesh."
+  { ip link set "$p" master br0 && ip link set "$p" up; } || warn "cannot add $p to br0"
 done
-for _ in $(seq 20); do   # joining or creating the cell takes a few seconds
+for _ in $(seq 20); do   # join or cell creation takes a few seconds
   iw dev "$MESH_IF" link 2>/dev/null | grep -q 'Joined IBSS' && break
   sleep 0.5
 done
 iw dev "$MESH_IF" link 2>/dev/null | grep -q 'Joined IBSS' \
-  || warn "$MESH_IF has not joined the ad-hoc cell yet (check: iw dev $MESH_IF link). It may still be scanning."
+  || warn "$MESH_IF not joined yet (iw dev $MESH_IF link)"
 
-# 5. Per-node files and the services on the bridge
+# 5. Per-node files, services on the bridge
 render "$TPL/dnsmasq.conf.tpl" /etc/dnsmasq.d/mesh.conf IP="$MYIP" IP_PREFIX="$IP_PREFIX" ID="$ID" GROUP="$GROUP"
 printf 'ID=%s\nMYIP=%s\nGROUP=%s\nMESH_IF=%s\nMESH_BSSID=%s\n' "$ID" "$MYIP" "$GROUP" "$MESH_IF" "$BSSID" > /etc/default/mesh
 install -d /run/dnsmasq; : > /run/dnsmasq/upstream.conf
 touch /etc/hosts.mesh
 install -d /var/www/mesh
-[ -e /var/www/mesh/index.html ] || echo "<h1>$GROUP</h1><p>Looking for other nodes...</p>" > /var/www/mesh/index.html
-systemctl restart dnsmasq || { journalctl -t dnsmasq -n 5 --no-pager >&2 || true; fail "dnsmasq rejected the rendered /etc/dnsmasq.d/mesh.conf (see above)."; }
+[ -e /var/www/mesh/index.html ] || echo "<h1>$GROUP</h1>" > /var/www/mesh/index.html
+systemctl restart dnsmasq || { journalctl -t dnsmasq -n 5 --no-pager >&2 || true; fail "dnsmasq failed to start"; }
 grep -qx 'nameserver 127.0.0.1' /etc/resolv.conf 2>/dev/null \
-  || { rm -f /etc/resolv.conf; printf 'nameserver 127.0.0.1\nsearch mesh\n' > /etc/resolv.conf; }   # undo the dispatcher's no-dnsmasq fallback
-systemctl start avahi-daemon || warn "avahi-daemon failed to start; other nodes' names will not resolve (journalctl -u avahi-daemon)."
-# caddy is ordered After=mesh.service, so it must be queued (--no-block): waiting
-# for it from inside mesh.service's own start would deadlock until the timeout.
+  || { rm -f /etc/resolv.conf; printf 'nameserver 127.0.0.1\nsearch mesh\n' > /etc/resolv.conf; }
+systemctl start avahi-daemon || warn "avahi-daemon failed to start"
+# caddy is After=mesh.service: queue it, do not wait for it
 if command -v caddy >/dev/null 2>&1; then
-  systemctl restart --no-block caddy || warn "caddy could not be started (journalctl -u caddy)."
+  systemctl restart --no-block caddy || warn "caddy failed to start"
 fi
 
-# 6. The mesh is up. The uplink radio's role (external network / access point) is
-#    a separate unit, so the ESP32 can be plugged and unplugged at any time: udev
-#    starts mesh-uplink@IFACE when it appears, systemd stops it when it goes.
-#    Gateway status is re-evaluated on every network change and every 2 minutes.
+# 6. Uplink role (separate unit, started by udev when the radio appears)
 touch "$RUN/up"
 UPLINK_IF=$(resolve_uplink_if "$MESH_IF" || true)
 if [ "$UPLINK" = off ]; then
   :
 elif [ -n "$UPLINK_IF" ] && [ -e "/sys/class/net/$UPLINK_IF" ]; then
-  systemctl start --no-block "mesh-uplink@$UPLINK_IF.service" || warn "could not queue the uplink role on $UPLINK_IF."
+  systemctl start --no-block "mesh-uplink@$UPLINK_IF.service" || warn "cannot start mesh-uplink@$UPLINK_IF"
 else
-  warn "no uplink radio is attached (uplink_if=${uplink_if:-auto}); the mesh runs without it. Plug in the ESP32-C5 and its '$UPLINK' role starts by itself."
+  warn "no uplink radio attached (uplink_if=${uplink_if:-auto})"
 fi
 systemctl start --no-block mesh-role-check.service 2>/dev/null || true
 n=$(wc -l < "$WARN")
-logger -t mesh-up "node $ID up at $MYIP on $MESH_IF (cell '$MESH_ID' $BSSID, $FREQ MHz), uplink=$UPLINK on ${UPLINK_IF:-none}, warnings=$n"
+logger -t mesh-up "up: $ID $MYIP $MESH_IF cell '$MESH_ID' $BSSID $FREQ MHz uplink=$UPLINK/${UPLINK_IF:-none} warnings=$n"
 exit 0
 EOF
 
   cat > /usr/local/sbin/mesh-down.sh <<'EOF'
 #!/bin/bash
-# Undo mesh-up.sh and hand every interface back to NetworkManager.
-# Runs as ExecStopPost of mesh.service, so it also runs when mesh-up.sh failed
-# half way. Every step tolerates things that never came up; it can run twice.
+# Undo mesh-up.sh (ExecStopPost of mesh.service, also after a failed start).
+# Idempotent.
 set -u
 . /usr/local/lib/mesh/common.sh
 load_conf
@@ -640,18 +598,16 @@ MESH_IF=$(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null)
 UPLINK_IF=$(cat "$RUN/uplink" 2>/dev/null || true)
 
 rm -f "$RUN/up"
-systemctl stop 'mesh-uplink@*.service' 2>/dev/null          # runs the uplink "down" action
+systemctl stop 'mesh-uplink@*.service' 2>/dev/null
 systemctl stop mesh-role-check.timer mesh-hosts.timer hostapd caddy avahi-daemon 2>/dev/null
 nft delete table inet meshgw 2>/dev/null
 rm -f "$RUN/uplink" "$RUN/gateway"
 
 [ -n "$MESH_IF" ] && batctl if del "$MESH_IF" 2>/dev/null
 ip link del bat0 2>/dev/null
-ip link del br0 2>/dev/null                      # releases eth0 / usb0
+ip link del br0 2>/dev/null
 
-# Reset the mesh radio only while it is still ours. When NetworkManager already
-# has it (second run, or a start that failed before the hand-over) leave it
-# alone: the reset would knock it off the Wi-Fi it has just rejoined.
+# Reset the mesh radio only while NetworkManager does not have it.
 if [ -n "$MESH_IF" ]; then
   case "$(nmcli -g GENERAL.STATE device show "$MESH_IF" 2>/dev/null)" in
     *unmanaged*|"")
@@ -666,29 +622,24 @@ for d in "$MESH_IF" "$UPLINK_IF" eth0; do
   [ -n "$d" ] && [ -e "/sys/class/net/$d" ] && nmcli device set "$d" managed yes >/dev/null 2>&1
 done
 
-# DNS: drop the mesh upstreams and use whatever NetworkManager has right now.
-# (If dnsmasq cannot start, the dispatcher points resolv.conf at those servers directly.)
+# DNS: forward to NetworkManager's servers again
 systemctl is-active --quiet dnsmasq || systemctl start dnsmasq 2>/dev/null
 if [ -x /etc/NetworkManager/dispatcher.d/50-mesh-dns ]; then
   /etc/NetworkManager/dispatcher.d/50-mesh-dns any refresh
 else
   : > /run/dnsmasq/upstream.conf 2>/dev/null; pkill -HUP -x dnsmasq 2>/dev/null
 fi
-logger -t mesh-down "mesh stopped, radios returned to NetworkManager"
+logger -t mesh-down "mesh stopped"
 exit 0
 EOF
 
   cat > /usr/local/sbin/mesh-uplink.sh <<'EOF'
 #!/bin/bash
-# Apply or clear the uplink radio's role: "mesh-uplink.sh IFACE up|down|check".
-# Runs from mesh-uplink@IFACE.service, which udev starts when the radio appears
-# and systemd stops when it is unplugged or the mesh stops. "check" is the
-# two-minute fallback in case udev missed an event.
-#
-# Roles:  external  the radio stays with NetworkManager, which connects it to the
-#                   user's own saved profile (eduroam, home Wi-Fi, ...). Nothing
-#                   about that network is configured here.
-#         ap        hostapd broadcasts the group's shared access point on it.
+# Uplink radio role: "mesh-uplink.sh IFACE up|down|check". Run by
+# mesh-uplink@IFACE.service (udev starts it with the radio); "check" is the
+# periodic fallback.
+#   external  NetworkManager keeps the radio and activates the chosen connection
+#   ap        hostapd broadcasts the group access point
 set -u
 . /usr/local/lib/mesh/common.sh
 IF=${1:-}; ACTION=${2:-up}
@@ -696,10 +647,10 @@ IF=${1:-}; ACTION=${2:-up}
 load_conf
 UPLINK=${uplink:-ap}
 PROFILE=${uplink_profile:-auto}
-# Log a warning and remember it for the menu's status page.
+# Log a warning and record it for the status page.
 warn() { echo "mesh-uplink: WARNING: $*" >&2; logger -t mesh-uplink -p user.warning "WARNING: $*"; echo "$*" >> "$WARN"; }
 MESH_IF=$(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null)
-is_uplink() {   # is $1 the interface the uplink role belongs to?
+is_uplink() {   # does $1 carry the uplink role?
   [ -n "$1" ] && [ "$1" != "$MESH_IF" ] || return 1
   case ${uplink_if:-auto} in
     auto) [ -e "/sys/class/net/$1/phy80211" ] ;;
@@ -712,7 +663,7 @@ case $ACTION in
     [ -e "$RUN/up" ] || exit 0
     cur=$(cat "$RUN/uplink" 2>/dev/null || true)
     if [ -n "$cur" ] && [ ! -e "/sys/class/net/$cur" ]; then
-      systemctl stop "mesh-uplink@$cur.service" 2>/dev/null     # unplugged and udev missed it
+      systemctl stop "mesh-uplink@$cur.service" 2>/dev/null
       cur=""
     fi
     if [ -z "$cur" ] && [ "$UPLINK" != off ]; then
@@ -723,66 +674,63 @@ case $ACTION in
   down)
     [ -n "$IF" ] && [ "$IF" != "$MESH_IF" ] || exit 0
     if [ "$(cat "$RUN/uplink" 2>/dev/null)" = "$IF" ]; then
-      # This interface carried the role: stop what belonged to it. An external
-      # connection is NetworkManager's and is left as it is.
+      # external connections stay with NetworkManager
       systemctl stop hostapd 2>/dev/null
       rm -f "$RUN/uplink"
-      [ -x /usr/local/sbin/mesh-role.sh ] && /usr/local/sbin/mesh-role.sh UNPLUGGED   # re-evaluate the gateway role
+      [ -x /usr/local/sbin/mesh-role.sh ] && /usr/local/sbin/mesh-role.sh UNPLUGGED
       logger -t mesh-uplink "$IF released"
     fi
     exit 0 ;;
 esac
 
 # up
-[ -e "$RUN/up" ] || { echo "mesh-uplink: the mesh is not running" >&2; exit 0; }
-[ -n "$IF" ] && [ -e "/sys/class/net/$IF" ] || { echo "mesh-uplink: interface '$IF' is not present" >&2; exit 1; }
-is_uplink "$IF" || { echo "mesh-uplink: $IF is not the uplink radio (uplink_if=${uplink_if:-auto}); nothing to do" >&2; exit 0; }
+[ -e "$RUN/up" ] || { echo "mesh-uplink: mesh not running" >&2; exit 0; }
+[ -n "$IF" ] && [ -e "/sys/class/net/$IF" ] || { echo "mesh-uplink: no interface '$IF'" >&2; exit 1; }
+is_uplink "$IF" || { echo "mesh-uplink: $IF is not the uplink interface" >&2; exit 0; }
 cur=$(cat "$RUN/uplink" 2>/dev/null || true)
 if [ -n "$cur" ] && [ "$cur" != "$IF" ] && [ -e "/sys/class/net/$cur" ]; then
-  echo "mesh-uplink: $cur already carries the uplink role; ignoring $IF" >&2; exit 0
+  echo "mesh-uplink: uplink already on $cur" >&2; exit 0
 fi
 [ "$UPLINK" = off ] && { logger -t mesh-uplink "$IF present but uplink=off"; exit 0; }
 echo "$IF" > "$RUN/uplink"
 case "$UPLINK" in
   external)
-    # NetworkManager owns the radio. If a saved profile was chosen, activate it;
-    # with "auto", NetworkManager's own autoconnect does the job.
+    # "auto": NetworkManager autoconnect
     nmcli device set "$IF" managed yes >/dev/null 2>&1 || true
     if [ "$PROFILE" != auto ]; then
       if ! nmcli -g connection.id connection show "$PROFILE" >/dev/null 2>&1; then
-        warn "NetworkManager has no profile called '$PROFILE'. Connect to the external network once (desktop, or 'nmcli device wifi connect ...' while the mesh is off) so the profile exists, then pick it in mesh-config menu 3."
+        warn "NetworkManager connection '$PROFILE' not found"
       else
-        # A Wi-Fi profile made on the built-in radio is pinned to it; it must float to the ESP32.
+        # a connection pinned to the mesh radio must float to the uplink radio
         if [ "$(nmcli -g connection.interface-name connection show "$PROFILE" 2>/dev/null)" = "$MESH_IF" ]; then
           nmcli connection modify "$PROFILE" connection.interface-name "" >/dev/null 2>&1 \
-            && logger -t mesh-uplink "profile '$PROFILE' was pinned to $MESH_IF; unpinned so it can use $IF"
+            && logger -t mesh-uplink "connection '$PROFILE': interface-name $MESH_IF cleared"
         fi
         if [ "$(nmcli -g connection.type connection show "$PROFILE" 2>/dev/null)" = 802-11-wireless ]; then
           nmcli -w 30 connection up id "$PROFILE" ifname "$IF" >/dev/null 2>&1 \
             || nmcli -w 30 connection up id "$PROFILE" >/dev/null 2>&1 \
-            || warn "could not bring up NetworkManager profile '$PROFILE' on $IF (nmcli connection up '$PROFILE')."
+            || warn "nmcli connection up '$PROFILE' failed"
         else
           nmcli -w 30 connection up id "$PROFILE" >/dev/null 2>&1 \
-            || warn "could not bring up NetworkManager profile '$PROFILE' (nmcli connection up '$PROFILE')."
+            || warn "nmcli connection up '$PROFILE' failed"
         fi
       fi
     fi
     systemctl start --no-block mesh-role-check.service 2>/dev/null
-    logger -t mesh-uplink "$IF handed to NetworkManager (profile: $PROFILE); gateway role follows the internet route"
+    logger -t mesh-uplink "$IF: external, connection $PROFILE"
     ;;
   ap)
-    AP_SSID=${ap_ssid:-$GROUP-mesh}                  # one SSID for the whole group: laptops roam between AP nodes
+    AP_SSID=${ap_ssid:-$GROUP-mesh}
     AP_CHANNEL=${ap_channel:-auto}
     if [ "$AP_CHANNEL" = auto ]; then
-      # ESP-Hosted cannot pick a channel itself, so spread the AP nodes over the
-      # four non-DFS 5 GHz channels by hashing the node id.
+      # one of the non-DFS 5 GHz channels, by node id
       AP_CHANNEL=$((36 + 4 * (0x$(printf %s "${id:-}" | md5sum | cut -c1-2) % 4)))
     fi
     nmcli device set "$IF" managed no >/dev/null 2>&1 || true
     render "$TPL/hostapd.conf.tpl" /etc/hostapd/hostapd.conf UPLINK_IF="$IF" AP_SSID="$AP_SSID" AP_CHANNEL="$AP_CHANNEL" AP_PSK="${ap_psk:-$GROUP.mesh}"
     systemctl start hostapd \
-      || { warn "hostapd (access point '$AP_SSID' on $IF, channel $AP_CHANNEL) failed to start (journalctl -u hostapd). Is the ESP-Hosted driver built with ap_support?"; exit 1; }
-    logger -t mesh-uplink "$IF broadcasting '$AP_SSID' on channel $AP_CHANNEL (max 8 clients per ESP32)"
+      || { warn "hostapd failed to start on $IF ('$AP_SSID', channel $AP_CHANNEL)"; exit 1; }
+    logger -t mesh-uplink "$IF: ap '$AP_SSID' channel $AP_CHANNEL"
     ;;
 esac
 exit 0
@@ -790,32 +738,28 @@ EOF
 
   cat > /usr/local/sbin/mesh-role.sh <<'EOF'
 #!/bin/bash
-# Promote or demote this node as an internet gateway for the mesh, depending on
-# whether some NetworkManager connection outside the mesh (the ESP32 radio on
-# eduroam or a home Wi-Fi, Ethernet, PPPoE, ...) currently reaches the internet.
-# Called on every network change (NetworkManager dispatcher), by the two-minute
-# timer, and when the uplink radio is unplugged. Arg: an event name, for the log.
+# Gateway role: on while a connection outside the mesh reaches the internet,
+# off otherwise. Run on every NetworkManager event, by the periodic timer and
+# when the uplink radio is unplugged. Arg: event name for the log.
 set -u
 . /usr/local/lib/mesh/common.sh
 EV=${1:-CHECK}; [ "$EV" = - ] && EV=CHECK
-# Only meaningful while the mesh runs; otherwise leave routes and DNS alone.
 case "$(systemctl is-active mesh.service 2>/dev/null)" in active|activating) ;; *) exit 0 ;; esac
 load_conf
 PFX=${mesh_prefix:-10}
-WAS=$(cat "$RUN/gateway" 2>/dev/null || true)     # interface we are currently a gateway on, if any
+WAS=$(cat "$RUN/gateway" 2>/dev/null || true)     # current gateway interface, if any
 
-# online: does interface $1 really reach the internet?  peer_ip: a batman originator MAC
-# to that node's mesh address.  nm_name: NetworkManager's connection name on interface $1.
+# online: $1 reaches the internet.  peer_ip: batman originator MAC to mesh address.
+# nm_name: NetworkManager connection on $1.
 online()  { curl -fsm5 -o /dev/null --interface "$1" http://detectportal.firefox.com/success.txt; }
 peer_ip() { echo "$PFX.$((0x${1:12:2})).$((0x${1:15:2})).1"; }
 nm_name() { nmcli -g GENERAL.CONNECTION device show "$1" 2>/dev/null; }
-upstream_from() {   # dnsmasq upstream list = the DNS servers NetworkManager got on $1
+upstream_from() {   # dnsmasq forwarders = NetworkManager's DNS servers on $1
   local dns; dns=$(nmcli -g IP4.DNS device show "$1" 2>/dev/null | tr '|' '\n' | sed 's/[[:space:]]//g; /^$/d')
   { for d in ${dns:-1.1.1.1}; do echo "server=$d@$1"; done; } > /run/dnsmasq/upstream.conf
 }
 
-# Become a gateway: NAT out of $1 (the interface with the internet route), announce it
-# via batman-adv, and forward the mesh's DNS to the servers NetworkManager got on $1.
+# Gateway on: NAT via $1, batman-adv gateway announcement, DNS forwarders from $1.
 gateway_on() {
   nft delete table inet meshgw 2>/dev/null
   render "$TPL/meshgw.nft.tpl" /etc/nftables.d/meshgw.nft UPLINK_IF="$1" && nft -f /etc/nftables.d/meshgw.nft
@@ -823,9 +767,9 @@ gateway_on() {
   batctl gw_mode server 50mbit/20mbit
   upstream_from "$1"
   echo "$1" > "$RUN/gateway"
-  logger -t mesh-role "gateway ON via $1 ('$(nm_name "$1")', event=$EV)"
+  logger -t mesh-role "gateway on: $1 ($(nm_name "$1")) [$EV]"
 }
-# Stop being a gateway and route through the best gateway batman-adv knows about, if any.
+# Gateway off: route through the gateway batman-adv selected, if any.
 gateway_off() {
   nft delete table inet meshgw 2>/dev/null
   batctl gw_mode client
@@ -838,7 +782,7 @@ gateway_off() {
     : > /run/dnsmasq/upstream.conf
   fi
   rm -f "$RUN/gateway"
-  [ -n "$WAS" ] && logger -t mesh-role "gateway OFF (was via $WAS, event=$EV)"
+  [ -n "$WAS" ] && logger -t mesh-role "gateway off (was $WAS) [$EV]"
 }
 
 dev=$(external_dev)
@@ -853,7 +797,7 @@ EOF
 
   cat > /usr/local/sbin/mesh-hosts.sh <<'EOF'
 #!/bin/bash
-# Rebuild /etc/hosts.mesh from mDNS and regenerate the group directory page.
+# Rebuild /etc/hosts.mesh from mDNS and the directory page.
 systemctl is-active --quiet mesh.service || exit 0
 . /usr/local/lib/mesh/common.sh
 load_conf
@@ -889,8 +833,7 @@ Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=120
 ExecStart=/usr/local/sbin/mesh-up.sh
-# ExecStopPost, not ExecStop: it also runs when mesh-up.sh failed half way, so
-# the radio always goes back to NetworkManager.
+# ExecStopPost also runs after a failed start
 ExecStopPost=/usr/local/sbin/mesh-down.sh
 
 [Install]
@@ -899,9 +842,7 @@ EOF
   cat > /etc/systemd/system/mesh-uplink@.service <<'EOF'
 [Unit]
 Description=Uplink radio role on %i (external network or access point)
-# Runs only while the mesh is up (condition) and only while the radio exists
-# (BindsTo its device): udev starts it when %i appears, systemd stops it when
-# %i is unplugged, and stopping the mesh stops it first (PartOf + After).
+# started by udev when %i appears, stopped when %i disappears or the mesh stops
 ConditionPathExists=/run/mesh/up
 BindsTo=sys-subsystem-net-devices-%i.device
 After=sys-subsystem-net-devices-%i.device mesh.service
@@ -921,10 +862,7 @@ Type=oneshot
 ExecStart=/usr/local/sbin/mesh-uplink.sh - check
 ExecStart=/usr/local/sbin/mesh-role.sh CHECK
 EOF
-  # The timers belong to mesh.service: started with it (Wants= there), not
-  # started if it fails and stopped whenever it goes down (BindsTo= + After=
-  # here), never enabled at boot on their own. Running them while the mesh is
-  # off used to wipe the DNS upstream list every two minutes.
+  # timers run only while mesh.service is active (Wants= there, BindsTo= here)
   cat > /etc/systemd/system/mesh-role-check.timer <<'EOF'
 [Unit]
 Description=Run the gateway role check every two minutes while the mesh runs
@@ -952,23 +890,20 @@ OnActiveSec=15
 OnUnitActiveSec=1min
 EOF
 
-  # --- activate
-  # hostapd is started by the mesh scripts only. NetworkManager's own
-  # wpa_supplicant.service is deliberately left alone: stopping it drops Wi-Fi.
+  # --- activate (NetworkManager's wpa_supplicant.service is left alone)
   systemctl disable --now hostapd dhcpcd >/dev/null 2>&1 || true
   systemctl disable caddy >/dev/null 2>&1 || true
   systemctl daemon-reload
-  systemctl disable mesh-hosts.timer mesh-role-check.timer >/dev/null 2>&1 || true   # older installs ran them at boot
+  systemctl disable mesh-hosts.timer mesh-role-check.timer >/dev/null 2>&1 || true
   systemctl enable dnsmasq >/dev/null 2>&1 || echo "WARNING: could not enable dnsmasq at boot" >&2
   systemctl reset-failed dnsmasq >/dev/null 2>&1 || true
   if ! systemctl restart dnsmasq; then
     journalctl -t dnsmasq -n 10 --no-pager >&2 || true
-    fail "dnsmasq failed to start (see above). The resolver was left untouched, so the network still works."
+    fail "dnsmasq failed to start"
   fi
 
-  # --- DNS hand-over to dnsmasq, done last and only once dnsmasq runs:
-  #     seed its upstream list from the servers in use right now, stop
-  #     NetworkManager writing resolv.conf, then point resolv.conf at dnsmasq.
+  # --- resolver: dnsmasq forwards to the current DNS servers; NetworkManager
+  #     stops writing resolv.conf; resolv.conf points at dnsmasq
   old_ns=$(sed -n 's/^nameserver[[:space:]]*//p' /etc/resolv.conf 2>/dev/null | grep -v '^127\.' || true)
   cat > /etc/NetworkManager/conf.d/99-mesh.conf <<'EOF'
 [main]
@@ -983,20 +918,20 @@ EOF
     printf 'server=%s\n' $old_ns > /run/dnsmasq/upstream.conf
     pkill -HUP -x dnsmasq 2>/dev/null || true
   fi
-  rm -f /etc/resolv.conf     # usually a symlink into /run/NetworkManager, which would dangle after a reboot
+  rm -f /etc/resolv.conf     # usually a symlink into /run/NetworkManager
   printf 'nameserver 127.0.0.1\nsearch mesh\n' > /etc/resolv.conf
 
   sysctl -q --system >/dev/null 2>&1 || true
-  modprobe batman-adv 2>/dev/null || echo "WARNING: kernel module batman-adv did not load (reboot after a kernel update?)" >&2
+  modprobe batman-adv 2>/dev/null || echo "WARNING: batman-adv module not loaded" >&2
   install -m 755 "$SELF" /usr/local/sbin/mesh-config 2>/dev/null || true
-  echo "System files written."
+  echo "System files written"
 )
 
-# Enable or disable the USB-C gadget port (dwc2 overlay + g_ether) in the boot files, per usb_gadget.
+# USB gadget (dwc2 + g_ether) in the boot files, per usb_gadget.
 apply_usb_gadget() {
   local cfg=/boot/firmware/config.txt cmd=/boot/firmware/cmdline.txt
   [ -f "$cfg" ] || { cfg=/boot/config.txt; cmd=/boot/cmdline.txt; }
-  [ -f "$cfg" ] && [ -f "$cmd" ] || { msg "Cannot find config.txt and cmdline.txt (looked in /boot/firmware and /boot); USB gadget setting not applied."; return 1; }
+  [ -f "$cfg" ] && [ -f "$cmd" ] || { msg "config.txt or cmdline.txt not found"; return 1; }
   if [ "$(cfg_get usb_gadget)" = yes ]; then
     grep -q '^dtoverlay=dwc2' "$cfg" || echo 'dtoverlay=dwc2' >> "$cfg"
     grep -q 'modules-load=dwc2,g_ether' "$cmd" || sed -i 's/$/ modules-load=dwc2,g_ether/' "$cmd"
@@ -1008,40 +943,39 @@ apply_usb_gadget() {
 
 # ------------------------------------------------------------------ menus ----
 
-# Menu 1: node identity (ID, group, display name) and the matching Linux user and web folder.
+# 1 Identity: node ID, group, display name, Linux user.
 menu_identity() {
   local id group display rc
-  id=$(ask "ID (letters and digits only). Becomes the hostname, the DNS name and the folder name under the group address." "$(cfg_get id)") || return
+  id=$(ask "Enter the node ID (letters and digits)" "$(cfg_get id)") || return
   id=$(echo "$id" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9')
-  [ -n "$id" ] || { msg "The ID cannot be empty."; return; }
-  group=$(ask "Group name. Must be identical on every Pi in the group. Becomes the shared address <group>.mesh/$id/, the mesh name <group>.mesh and the access point <group>-mesh." "$(cfg_get group)") || return
+  [ -n "$id" ] || { msg "ID must not be empty"; return; }
+  group=$(ask "Enter the group name (same on all nodes)" "$(cfg_get group)") || return
   group=$(echo "$group" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9')
   [ -n "$group" ] || group=group
-  display=$(ask "Display name (optional, shown on your folder's page)." "$(cfg_get display)") || return
+  display=$(ask "Enter a display name (optional)" "$(cfg_get display)") || return
   cfg_set id "$id"; cfg_set group "$group"; cfg_set display "$display"
   if id -u "$id" >/dev/null 2>&1; then
-    msg "Saved. Linux user '$id' already exists; the web folder is /home/$id/public."
-  elif yesno "Create Linux user '$id' now with a password, so the student can log in and edit /home/$id/public?"; then
+    msg "User $id exists. Web folder: /home/$id/public"
+  elif yesno "Create user $id?"; then
     clear
     if useradd -m -s /bin/bash "$id"; then
       install -d -o "$id" -g "$id" -m 755 "/home/$id/public"; chmod 755 "/home/$id"
-      passwd "$id" || echo "passwd failed; set it later with: sudo passwd $id"
+      passwd "$id" || echo "passwd failed"
     else
-      echo "useradd '$id' failed; see the message above."
+      echo "useradd failed"
     fi
     read -rp "Press Enter to continue"
   fi
   if ! installed; then
-    yesno "System files are not installed yet. Install them now? (needed before the mesh can start)" || return
+    yesno "System files are not installed. Install now?" || return
     clear; write_system_files; rc=$?
-    [ $rc -eq 0 ] || echo "INSTALL FAILED (exit $rc) - see the messages above."
+    [ $rc -eq 0 ] || echo "Install failed (exit $rc)"
     read -rp "Press Enter to continue"
   fi
 }
 
-# Turn the mesh off and make sure the teardown really ran. A start that failed
-# half way leaves the unit "failed", and for that unit "systemctl stop" does
-# nothing at all, so mesh-down.sh is run directly in that case.
+# Stop the mesh. After a failed start the unit is inactive and "systemctl stop"
+# does nothing, so mesh-down.sh runs directly in that case.
 mesh_off() {
   local was_active=0
   mesh_active && was_active=1
@@ -1050,26 +984,26 @@ mesh_off() {
   [ "$was_active" = 1 ] || run_checked /usr/local/sbin/mesh-down.sh || true
 }
 
-# After a start or stop: say what happened, including the mesh scripts' warnings.
+# Report the mesh state after a start or stop, with any warnings.
 report_mesh_state() {
   local f
   if mesh_active; then
     if [ -s "$WARN_FILE" ]; then
       f=$(mktemp)
       {
-        echo "Mesh is ON. This node is $(sed -n 's/^MYIP=//p' /etc/default/mesh 2>/dev/null) on $(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null)."; echo
-        echo "The mesh scripts reported these warnings:"; echo; sed 's/^/  - /' "$WARN_FILE"
+        echo "Mesh is on. Node address $(sed -n 's/^MYIP=//p' /etc/default/mesh 2>/dev/null) ($(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null))"; echo
+        echo "Warnings:"; sed 's/^/  /' "$WARN_FILE"
       } > "$f"
-      show_text "started with warnings" "$f"; rm -f "$f"
+      show_text "warnings" "$f"; rm -f "$f"
     else
-      msg "Mesh is ON. This node is $(sed -n 's/^MYIP=//p' /etc/default/mesh 2>/dev/null) on $(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null)."
+      msg "Mesh is on. Node address $(sed -n 's/^MYIP=//p' /etc/default/mesh 2>/dev/null) ($(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null))"
     fi
   else
-    msg "Mesh is OFF. The radios belong to NetworkManager again. Use menu 7 or 'nmcli device wifi connect <SSID> password <pw>' for normal Wi-Fi."
+    msg "Mesh is off"
   fi
 }
 
-# Re-apply the uplink role without restarting the whole mesh.
+# Re-apply the uplink role while the mesh keeps running.
 apply_uplink_now() {
   local cur
   cur=$(cat /run/mesh/uplink 2>/dev/null)
@@ -1080,78 +1014,78 @@ apply_uplink_now() {
   sleep 1
   cur=$(cat /run/mesh/uplink 2>/dev/null)
   if [ -n "$cur" ]; then
-    msg "Uplink role '$(cfg_get uplink)' applied on $cur. Check menu 8 (Status) in a few seconds."
+    msg "Uplink role applied on $cur"
   else
-    msg "No uplink radio is attached right now. The role starts by itself when the ESP32-C5 is plugged in."
+    msg "No uplink radio attached"
   fi
 }
 
-# Menu 2: turn the mesh on, off or restart it now; enable or disable it at boot.
+# 2 Mesh: start, stop, restart, enable or disable at boot.
 menu_mesh_status() {
   local now boot choice
-  mesh_active && now="ON" || now="OFF"
-  mesh_enabled && boot="yes" || boot="no"
-  choice=$(whiptail --title "$TITLE" --menu "Mesh is $now now. Start at boot: $boot.\n\nWhen the mesh is OFF, the radios belong to NetworkManager and normal Wi-Fi works." 18 70 6 \
-      "1" "Turn mesh ON now" \
-      "2" "Turn mesh OFF now (back to normal Wi-Fi)" \
-      "3" "Restart mesh (apply changed settings)" \
-      "4" "Start mesh at boot: enable" \
-      "5" "Start mesh at boot: disable" \
+  mesh_active && now="on" || now="off"
+  mesh_enabled && boot="enabled" || boot="disabled"
+  choice=$(whiptail --title "$TITLE" --menu "Mesh: $now   At boot: $boot" 16 60 5 \
+      "1 Start"   "Start the mesh" \
+      "2 Stop"    "Stop the mesh" \
+      "3 Restart" "Restart the mesh" \
+      "4 Enable"  "Start the mesh at boot" \
+      "5 Disable" "Do not start the mesh at boot" \
       3>&1 1>&2 2>&3) || return
-  installed || { msg "Install system files first (menu 6)."; return; }
-  case $choice in 1|3) [ -n "$(cfg_get id)" ] || { msg "Set the node identity first (menu 1)."; return; } ;; esac
+  choice=${choice%% *}
+  installed || { msg "System files are not installed (6 Install)"; return; }
+  case $choice in 1|3) [ -n "$(cfg_get id)" ] || { msg "Node ID is not set (1 Identity)"; return; } ;; esac
   clear
   case $choice in
     1) run_checked systemctl start mesh.service ;;
     2) mesh_off ;;
     3) run_checked systemctl restart mesh.service ;;
-    4) run_checked systemctl enable mesh.service && msg "The mesh will start at boot."; return ;;
-    5) run_checked systemctl disable mesh.service && msg "The mesh will not start at boot."; return ;;
+    4) run_checked systemctl enable mesh.service && msg "Mesh enabled at boot"; return ;;
+    5) run_checked systemctl disable mesh.service && msg "Mesh disabled at boot"; return ;;
   esac
   sleep 1
   report_mesh_state
 }
 
-# Pick one of NetworkManager's saved profiles for the external network.
+# Select a NetworkManager connection for the external network.
 choose_nm_profile() {
   local cur items=() name type dev
   cur=$(cfg_get uplink_profile)
-  items+=("auto" "let NetworkManager autoconnect whatever it knows" "$([ "$cur" = auto ] && echo ON || echo OFF)")
+  items+=("auto" "NetworkManager autoconnect" "$([ "$cur" = auto ] && echo ON || echo OFF)")
   while IFS=: read -r name type dev; do
     [ -n "$name" ] && [ "$type" != loopback ] || continue
     case $type in 802-11-wireless) type=wifi ;; 802-3-ethernet) type=ethernet ;; esac
     items+=("$name" "${type}${dev:+ (on $dev)}" "$([ "$cur" = "$name" ] && echo ON || echo OFF)")
   done < <(nmcli -t -f NAME,TYPE,DEVICE connection show 2>/dev/null)
-  whiptail --title "$TITLE" --radiolist "Saved NetworkManager profile to use for the external network (eduroam, home Wi-Fi, PPPoE, ...). Create it first: connect once from the desktop, or with 'nmcli device wifi connect <SSID> password <pw>' while the mesh is OFF, or 'nmcli connection add' for anything else." 22 76 10 \
+  whiptail --title "$TITLE" --radiolist "Select the NetworkManager connection for the external network" 20 72 10 \
       "${items[@]}" 3>&1 1>&2 2>&3
 }
 
-# Menu 3: which interface is the uplink radio and what it does (external network / access point / off).
+# 3 Uplink: uplink interface and role (external network, access point, off).
 menu_uplink() {
   local ifname role profile psk ssid chan cur_ssid
-  ifname=$(ask "Uplink radio interface (the ESP32-C5 via ESP-Hosted). 'auto' = the first Wi-Fi interface that is not the Pi's built-in radio. Wi-Fi interfaces now: $(wifi_ifaces)" "$(cfg_get uplink_if)") || return
-  [[ $ifname =~ ^(auto|[A-Za-z0-9_.-]{1,15})$ ]] || { msg "Enter 'auto' or an interface name such as wlan1."; return; }
-  role=$(whiptail --title "$TITLE" --radiolist "What should the uplink radio do?\n\nSpace selects, Enter confirms." 17 76 3 \
-      "external" "Join an external network via NetworkManager and share it (gateway)" "$([ "$(cfg_get uplink)" = external ] && echo ON || echo OFF)" \
-      "ap"       "Broadcast the group access point so laptops can join"          "$([ "$(cfg_get uplink)" = ap ] && echo ON || echo OFF)" \
-      "off"      "Leave the uplink radio unused"                                  "$([ "$(cfg_get uplink)" = off ] && echo ON || echo OFF)" \
+  ifname=$(ask "Enter the uplink interface (auto or a name). Present: $(wifi_ifaces)" "$(cfg_get uplink_if)") || return
+  [[ $ifname =~ ^(auto|[A-Za-z0-9_.-]{1,15})$ ]] || { msg "Invalid interface name"; return; }
+  role=$(whiptail --title "$TITLE" --radiolist "Select the uplink role" 14 60 3 \
+      "external" "External network via NetworkManager (gateway)" "$([ "$(cfg_get uplink)" = external ] && echo ON || echo OFF)" \
+      "ap"       "Access point"                                  "$([ "$(cfg_get uplink)" = ap ] && echo ON || echo OFF)" \
+      "off"      "Unused"                                        "$([ "$(cfg_get uplink)" = off ] && echo ON || echo OFF)" \
       3>&1 1>&2 2>&3) || return
-  # Nothing is written until every answer is in, so a cancelled dialog cannot
-  # leave mesh.conf half updated.
+  # mesh.conf is written only once all answers are in
   case $role in
     external)
       profile=$(choose_nm_profile) || return
       cfg_set uplink_if "$ifname"; cfg_set uplink external; cfg_set uplink_profile "$profile"
-      msg "The uplink radio stays with NetworkManager, which connects it to '$profile'. Nothing about that network is configured here. Whenever this node actually reaches the internet, on any interface, it becomes a gateway for the mesh; the moment it drops it stops being one."
+      msg "Uplink: external network, connection '$profile'"
       ;;
     ap)
       cur_ssid=$(ap_ssid_name)
-      ssid=$(ask "Access point name (SSID). Use the SAME name on every AP node so laptops roam between Pis. Default: <group>-mesh" "$cur_ssid") || return
-      [ -n "$ssid" ] && [ ${#ssid} -le 32 ] && [[ $ssid != *\"* ]] || { msg "The SSID must be 1 to 32 characters, without double quotes."; return; }
-      psk=$(ask "Access point passphrase (8 to 63 characters), the same on every AP node. Default: <group>.mesh" "$(ap_psk_value)") || return
-      [ ${#psk} -ge 8 ] && [ ${#psk} -le 63 ] || { msg "Passphrase must be 8 to 63 characters."; return; }
-      chan=$(whiptail --title "$TITLE" --radiolist "5 GHz channel for this Pi's access point. ESP-Hosted cannot choose one itself; 'auto' spreads the group over 36/40/44/48 by node ID." 15 74 5 \
-          "auto" "one of 36/40/44/48, picked from the node ID" "$([ "$(cfg_get ap_channel)" = auto ] && echo ON || echo OFF)" \
+      ssid=$(ask "Enter the access point SSID (same on all nodes)" "$cur_ssid") || return
+      [ -n "$ssid" ] && [ ${#ssid} -le 32 ] && [[ $ssid != *\"* ]] || { msg "SSID must be 1 to 32 characters without double quotes"; return; }
+      psk=$(ask "Enter the access point passphrase (8 to 63 characters)" "$(ap_psk_value)") || return
+      [ ${#psk} -ge 8 ] && [ ${#psk} -le 63 ] || { msg "Passphrase must be 8 to 63 characters"; return; }
+      chan=$(whiptail --title "$TITLE" --radiolist "Select the access point channel" 14 60 5 \
+          "auto" "36/40/44/48 by node ID" "$([ "$(cfg_get ap_channel)" = auto ] && echo ON || echo OFF)" \
           "36"   "5180 MHz" "$([ "$(cfg_get ap_channel)" = 36 ] && echo ON || echo OFF)" \
           "40"   "5200 MHz" "$([ "$(cfg_get ap_channel)" = 40 ] && echo ON || echo OFF)" \
           "44"   "5220 MHz" "$([ "$(cfg_get ap_channel)" = 44 ] && echo ON || echo OFF)" \
@@ -1160,95 +1094,95 @@ menu_uplink() {
       cfg_set uplink_if "$ifname"; cfg_set uplink ap; cfg_set ap_channel "$chan"
       cfg_set_or_follow ap_ssid "$ssid" "$(group_name)-mesh"
       cfg_set_or_follow ap_psk "$psk" "$(group_name).mesh"
-      msg "The uplink radio will broadcast '$ssid' (channel: $chan), bridged into the mesh. Laptops that join any AP node get an address from the mesh and reach every node's folder. Each ESP32 accepts at most 8 laptops, and the ESP-Hosted driver must be built with ap_support."
+      msg "Uplink: access point '$ssid', channel $chan"
       ;;
     off) cfg_set uplink_if "$ifname"; cfg_set uplink off ;;
   esac
   if mesh_active; then
-    yesno "Apply to the uplink radio now? (The mesh itself keeps running.)" && { clear; apply_uplink_now; }
+    yesno "Apply the uplink role now?" && { clear; apply_uplink_now; }
   elif [ "$role" != off ] && [ -z "$(uplink_candidates)" ]; then
-    msg "Note: no uplink radio is attached right now. The setting is saved; the role starts by itself when the ESP32-C5 is plugged in."
+    msg "No uplink radio attached. Setting saved"
   fi
   return 0
 }
 
-# Menu 4: the ad-hoc mesh itself (radio interface, network name, channel, address block).
+# 4 Radio: mesh interface, ad-hoc network name, channel, address block.
 menu_radio() {
   local mif mid ch pfx
-  mif=$(ask "Mesh radio interface. 'auto' = the Pi's built-in radio (brcmfmac), whatever it is named. Wi-Fi interfaces now: $(wifi_ifaces)" "$(cfg_get mesh_if)") || return
-  [[ $mif =~ ^(auto|[A-Za-z0-9_.-]{1,15})$ ]] || { msg "Enter 'auto' or an interface name such as wlan0."; return; }
-  mid=$(ask "Ad-hoc mesh name (the IBSS network name, identical on every Pi; the cell id is derived from it). Default: <group>.mesh" "$(mesh_name)") || return
-  [ -n "$mid" ] && [ ${#mid} -le 32 ] && [[ $mid != *\"* ]] || { msg "The mesh name must be 1 to 32 characters, without double quotes."; return; }
-  ch=$(whiptail --title "$TITLE" --radiolist "2.4 GHz channel for the mesh (identical on every Pi)" 12 60 3 \
+  mif=$(ask "Enter the mesh interface (auto or a name). Present: $(wifi_ifaces)" "$(cfg_get mesh_if)") || return
+  [[ $mif =~ ^(auto|[A-Za-z0-9_.-]{1,15})$ ]] || { msg "Invalid interface name"; return; }
+  mid=$(ask "Enter the ad-hoc network name (same on all nodes)" "$(mesh_name)") || return
+  [ -n "$mid" ] && [ ${#mid} -le 32 ] && [[ $mid != *\"* ]] || { msg "Name must be 1 to 32 characters without double quotes"; return; }
+  ch=$(whiptail --title "$TITLE" --radiolist "Select the mesh channel (same on all nodes)" 12 60 3 \
       "1" "2412 MHz" "$([ "$(cfg_get mesh_channel)" = 1 ] && echo ON || echo OFF)" \
       "6" "2437 MHz" "$([ "$(cfg_get mesh_channel)" = 6 ] && echo ON || echo OFF)" \
       "11" "2462 MHz" "$([ "$(cfg_get mesh_channel)" = 11 ] && echo ON || echo OFF)" \
       3>&1 1>&2 2>&3) || return
-  pfx=$(ask "First octet of the mesh address block (10 gives 10.X.Y.1/8). Change it only if the external network hands out 10.x addresses." "$(cfg_get mesh_prefix)") || return
-  [[ $pfx =~ ^[0-9]+$ ]] && [ "$pfx" -ge 1 ] && [ "$pfx" -le 223 ] || { msg "The first octet must be a number from 1 to 223."; return; }
+  pfx=$(ask "Enter the first octet of the mesh address block (10 = 10.X.Y.1/8)" "$(cfg_get mesh_prefix)") || return
+  [[ $pfx =~ ^[0-9]+$ ]] && [ "$pfx" -ge 1 ] && [ "$pfx" -le 223 ] || { msg "Octet must be 1 to 223"; return; }
   cfg_set mesh_if "$mif"; cfg_set mesh_channel "$ch"; cfg_set mesh_prefix "$pfx"
   cfg_set_or_follow mesh_id "$mid" "$(group_name).mesh"
-  msg "Saved. The ad-hoc mesh is an OPEN network (the Pi's radio offers no usable ad-hoc encryption): anyone within range can join the group LAN."
-  mesh_active && yesno "Restart the mesh now to apply?" && { clear; run_checked systemctl restart mesh.service && report_mesh_state; }
+  msg "Mesh radio settings saved. The ad-hoc network is open (no encryption)"
+  mesh_active && yesno "Restart the mesh now?" && { clear; run_checked systemctl restart mesh.service && report_mesh_state; }
   return 0
 }
 
-# Menu 5: wired ways into the mesh (Ethernet bridge, USB-C gadget).
+# 5 Ports: wired mesh ports (Ethernet bridge, USB gadget).
 menu_ports() {
   local sel
-  sel=$(whiptail --title "$TITLE" --checklist "Wired ways for a laptop to join this Pi's mesh. Space toggles. (Leave Ethernet unticked if eth0 is your external network, e.g. PPPoE.)" 14 74 2 \
-      "eth0" "Bridge the Ethernet port into the mesh"             "$([ "$(cfg_get bridge_eth0)" = yes ] && echo ON || echo OFF)" \
-      "usb"  "USB-C gadget mode: one cable = power + network (Pi 4/5, needs reboot)" "$([ "$(cfg_get usb_gadget)" = yes ] && echo ON || echo OFF)" \
+  sel=$(whiptail --title "$TITLE" --checklist "Select wired mesh ports" 12 60 2 \
+      "eth0" "Ethernet port"             "$([ "$(cfg_get bridge_eth0)" = yes ] && echo ON || echo OFF)" \
+      "usb"  "USB gadget (needs reboot)" "$([ "$(cfg_get usb_gadget)" = yes ] && echo ON || echo OFF)" \
       3>&1 1>&2 2>&3) || return
   [[ $sel == *eth0* ]] && cfg_set bridge_eth0 yes || cfg_set bridge_eth0 no
   [[ $sel == *usb* ]]  && cfg_set usb_gadget yes  || cfg_set usb_gadget no
   apply_usb_gadget || return
-  msg "Saved. USB gadget changes take effect after a reboot; Ethernet bridging applies on the next mesh start."
+  msg "Port settings saved"
 }
 
-# Menu 6: write or refresh every system file.
+# 6 Install: write or refresh the system files.
 menu_install() {
   local rc
-  yesno "Write or refresh every system file (scripts, units, templates, firewall, udev, NetworkManager and dnsmasq config) and install packages? Existing mesh.conf settings are kept." || return
+  yesno "Install system files and packages?" || return
   clear; write_system_files; rc=$?
-  [ $rc -eq 0 ] || echo "INSTALL FAILED (exit $rc) - see the messages above."
+  [ $rc -eq 0 ] || echo "Install failed (exit $rc)"
   read -rp "Press Enter to continue"
 }
 
-# Menu 7: join a normal Wi-Fi network through NetworkManager (turns the mesh off first).
+# 7 Wi-Fi: join a Wi-Fi network through NetworkManager (stops the mesh).
 menu_wifi() {
   local list ssid pw
   if mesh_active; then
-    yesno "The mesh is ON and owns the built-in radio. Turn it OFF now so it can join normal Wi-Fi?" || return
+    yesno "The mesh is on. Stop it?" || return
     clear; mesh_off; sleep 2
   fi
   clear; echo "Scanning..."; nmcli device wifi rescan 2>/dev/null; sleep 3
   list=$(nmcli -t -f SSID,SIGNAL device wifi list 2>/dev/null | awk -F: '$1!="" && !seen[$1]++ {print $1"\t"$2"%"}' | sort -t$'\t' -k2 -rn | head -20)
-  [ -n "$list" ] || { msg "No networks found. Is the mesh off and the radio managed by NetworkManager? Check with: nmcli device status"; return; }
+  [ -n "$list" ] || { msg "No networks found"; return; }
   local -a items=()
   while IFS=$'\t' read -r s sig; do items+=("$s" "$sig"); done <<< "$list"
-  ssid=$(whiptail --title "$TITLE" --menu "Pick a network (the profile NetworkManager saves can later serve as the external network)" 22 70 12 "${items[@]}" 3>&1 1>&2 2>&3) || return
-  pw=$(pass "Password for $ssid (leave empty for an open network)") || return
+  ssid=$(whiptail --title "$TITLE" --menu "Select a network" 22 70 12 "${items[@]}" 3>&1 1>&2 2>&3) || return
+  pw=$(pass "Enter the password for $ssid") || return
   clear
   if [ -n "$pw" ]; then nmcli device wifi connect "$ssid" password "$pw"; else nmcli device wifi connect "$ssid"; fi \
-    || echo "Could not connect to '$ssid'; see the message above."
+    || echo "Connection to $ssid failed"
   read -rp "Press Enter to continue"
 }
 
-# Menu 8 and "status": one page with config, services, radios, gateway, neighbours, names and the recent log.
+# 8 Status.
 show_status() {
   local f mif uif gw; f=$(mktemp)
   mif=$(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null); uif=$(cat /run/mesh/uplink 2>/dev/null); gw=$(cat /run/mesh/gateway 2>/dev/null)
   {
     echo "mesh.conf: $CONF"; echo "----"; sed 's/^\(ap_psk\|mesh_psk\)=.*/\1=(hidden)/' "$CONF" 2>/dev/null
-    echo "derived: group=$(group_name) mesh name=$(mesh_name) access point=$(ap_ssid_name)"
+    echo "Derived: group=$(group_name) mesh=$(mesh_name) ap=$(ap_ssid_name)"
     echo; echo "mesh.service: $(systemctl is-active mesh.service) (boot: $(systemctl is-enabled mesh.service 2>/dev/null))"
     echo "dnsmasq: $(systemctl is-active dnsmasq)  avahi: $(systemctl is-active avahi-daemon)  caddy: $(systemctl is-active caddy 2>/dev/null)  hostapd: $(systemctl is-active hostapd)"
     echo; echo "Wi-Fi interfaces: $(wifi_ifaces)"
-    echo "Mesh radio: ${mif:-not running}  $(iw dev "${mif:-none}" link 2>/dev/null | head -1)"
-    echo "Uplink radio: ${uif:-none attached} (configured: $(cfg_get uplink_if), role: $(cfg_get uplink), profile: $(cfg_get uplink_profile)) mesh-uplink@${uif:-?}: $(systemctl is-active "mesh-uplink@${uif:-none}" 2>/dev/null)"
+    echo "Mesh radio: ${mif:-none}  $(iw dev "${mif:-none}" link 2>/dev/null | head -1)"
+    echo "Uplink radio: ${uif:-none} (uplink_if=$(cfg_get uplink_if) role=$(cfg_get uplink) profile=$(cfg_get uplink_profile)) mesh-uplink@${uif:-?}: $(systemctl is-active "mesh-uplink@${uif:-none}" 2>/dev/null)"
     [ "$(systemctl is-active hostapd 2>/dev/null)" = active ] && echo "Access point: '$(sed -n 's/^ssid=//p' /etc/hostapd/hostapd.conf 2>/dev/null)' channel $(sed -n 's/^channel=//p' /etc/hostapd/hostapd.conf 2>/dev/null), clients: $(iw dev "${uif:-none}" station dump 2>/dev/null | grep -c '^Station') of 8"
-    if [ -n "$gw" ]; then echo "Gateway: ON via $gw ('$(nmcli -g GENERAL.CONNECTION device show "$gw" 2>/dev/null)')"; else echo "Gateway: OFF (using another node's gateway if batctl gwl lists one)"; fi
+    if [ -n "$gw" ]; then echo "Gateway: on via $gw ($(nmcli -g GENERAL.CONNECTION device show "$gw" 2>/dev/null))"; else echo "Gateway: off"; fi
     echo; echo "Interfaces (NetworkManager view):"; nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null | grep -v '^lo:'
     echo; echo "Addresses:"; ip -4 -br addr 2>/dev/null
     echo; echo "Default routes:"; ip route show default 2>/dev/null
@@ -1257,14 +1191,14 @@ show_status() {
     echo; echo "Gateways (batctl gwl):"; batctl gwl 2>/dev/null
     echo; echo "Names (/etc/hosts.mesh):"; cat /etc/hosts.mesh 2>/dev/null
     echo; echo "Upstream DNS:"; cat /run/dnsmasq/upstream.conf 2>/dev/null
-    if [ -s "$WARN_FILE" ]; then echo; echo "Warnings from the last mesh start:"; sed 's/^/  - /' "$WARN_FILE"; fi
-    echo; echo "Recent mesh log:"; journalctl -u mesh.service -u 'mesh-uplink@*' -u mesh-role-check.service -n 15 --no-pager 2>/dev/null
+    if [ -s "$WARN_FILE" ]; then echo; echo "Warnings:"; sed 's/^/  /' "$WARN_FILE"; fi
+    echo; echo "Log:"; journalctl -u mesh.service -u 'mesh-uplink@*' -u mesh-role-check.service -n 15 --no-pager 2>/dev/null
   } > "$f"
   show_text "status" "$f"
   rm -f "$f"
 }
 
-# The interactive whiptail menu loop.
+# Main menu.
 main_menu() {
   INTERACTIVE=1
   ensure_whiptail
@@ -1272,19 +1206,19 @@ main_menu() {
   while true; do
     local id state choice
     id=$(cfg_get id)
-    mesh_active && state="ON" || state="OFF"
-    choice=$(whiptail --title "$TITLE" --menu "ID: ${id:-<not set>}   Group: $(group_name)   Mesh: $state   uplink: $(cfg_get uplink)" 20 74 9 \
-      "1" "Node identity (ID, group, Linux user)" \
-      "2" "Mesh status (ON / OFF / at boot)" \
-      "3" "Uplink radio (ESP32-C5): external network / access point / off" \
-      "4" "Mesh radio (ad-hoc name, channel, address block, interface)" \
-      "5" "Wired access ports (Ethernet bridge, USB-C gadget)" \
-      "6" "Install or refresh system files" \
-      "7" "Join normal Wi-Fi (turns the mesh off)" \
-      "8" "Status" \
-      "9" "Finish" \
+    mesh_active && state="on" || state="off"
+    choice=$(whiptail --title "$TITLE" --menu "Node: ${id:-unset}   Group: $(group_name)   Mesh: $state   Uplink: $(cfg_get uplink)" 20 70 9 \
+      "1 Identity" "Node ID, group, user" \
+      "2 Mesh"     "Start, stop, enable at boot" \
+      "3 Uplink"   "External network, access point or off" \
+      "4 Radio"    "Ad-hoc name, channel, addresses" \
+      "5 Ports"    "Ethernet bridge, USB gadget" \
+      "6 Install"  "Install or refresh system files" \
+      "7 Wi-Fi"    "Join a Wi-Fi network (stops the mesh)" \
+      "8 Status"   "Show status" \
+      "9 Finish"   "Exit" \
       3>&1 1>&2 2>&3) || break
-    case $choice in
+    case ${choice%% *} in
       1) menu_identity ;;
       2) menu_mesh_status ;;
       3) menu_uplink ;;
@@ -1299,7 +1233,7 @@ main_menu() {
   clear
 }
 
-# Entry point: "install" and "status" are non-interactive, anything else opens the menu.
+# Entry point.
 case "${1:-}" in
   install) set_defaults; write_system_files; exit $? ;;
   status)  show_status ;;

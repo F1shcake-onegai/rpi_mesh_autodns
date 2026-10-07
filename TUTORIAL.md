@@ -409,8 +409,8 @@ sudo pkill -HUP -x dnsmasq                          # dnsmasq now forwards to th
 
 | Tutorial step | In `mesh-config.sh` |
 |---|---|
-| 1 | `write_system_files`, menu 6 |
-| 3 | `menu_identity`, menu 1; address and cell ID in `mesh-up.sh` steps 2 and 0 |
+| 1 | `write_system_files` (6 Install) |
+| 3 | `menu_identity` (1 Identity); address and cell ID in `mesh-up.sh` steps 2 and 0 |
 | 4 to 6 | `mesh-up.sh` steps 3 and 4, run by `mesh.service` |
 | 7 | templates in `/etc/mesh`, `mesh-hosts.sh` on a one-minute timer, the NetworkManager dispatcher `50-mesh-dns` |
 | 8 | the Caddyfile and `/etc/default/mesh`, started by `mesh-up.sh` step 5 |
