@@ -522,7 +522,7 @@ hostnamectl set-hostname "$ID"
 if grep -q '^127\.0\.1\.1' /etc/hosts; then sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$ID/" /etc/hosts; else printf '127.0.1.1\t%s\n' "$ID" >> /etc/hosts; fi
 id -u "$ID" >/dev/null 2>&1 || useradd -m -s /bin/bash "$ID"
 install -d -o "$ID" -g "$ID" -m 755 "/home/$ID/public"
-chmod 755 "/home/$ID"
+chmod 711 "/home/$ID"   # caddy reaches public/; other users cannot list the home folder
 
 # 2. Address from the mesh radio's MAC (peers derive a gateway's address the same way)
 m=$(cat "/sys/class/net/$MESH_IF/address")
@@ -828,12 +828,14 @@ EOF
 
   cat > /usr/local/sbin/mesh-hosts.sh <<'EOF'
 #!/bin/bash
-# Rebuild /etc/hosts.mesh from mDNS and the directory page.
+# Rebuild /etc/hosts.mesh from mDNS and the directory page. Names come from any
+# host on the open mesh: only valid ids and IPv4 addresses are taken, which
+# also keeps markup out of the page.
 systemctl is-active --quiet mesh.service || exit 0
 . /usr/local/lib/mesh/common.sh
 load_conf
 avahi-browse -trp _groupmesh._tcp 2>/dev/null \
-  | awk -F';' '$1=="=" && $3=="IPv4" {print $8, $4".mesh"}' \
+  | awk -F';' '$1=="=" && $3=="IPv4" && $4 ~ /^[a-z0-9]+$/ && $8 ~ /^[0-9]+(\.[0-9]+)(\.[0-9]+)(\.[0-9]+)$/ {print $8, $4".mesh"}' \
   | sort -u > /etc/hosts.mesh.new
 if ! cmp -s /etc/hosts.mesh.new /etc/hosts.mesh; then
   mv /etc/hosts.mesh.new /etc/hosts.mesh
@@ -991,7 +993,7 @@ menu_identity() {
   elif yesno "Create user $id?"; then
     clear
     if useradd -m -s /bin/bash "$id"; then
-      install -d -o "$id" -g "$id" -m 755 "/home/$id/public"; chmod 755 "/home/$id"
+      install -d -o "$id" -g "$id" -m 755 "/home/$id/public"; chmod 711 "/home/$id"
       passwd "$id" || echo "passwd failed"
     else
       echo "useradd failed"
