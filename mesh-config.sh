@@ -5,6 +5,7 @@
 #   sudo ./mesh-config.sh            interactive menu
 #   sudo ./mesh-config.sh install    write all system files
 #   sudo ./mesh-config.sh status     print status
+#   sudo ./mesh-config.sh uninstall  remove all system files, restore the originals
 #
 # Design:
 #   mesh radio     built-in Wi-Fi, open ad-hoc (IBSS) cell, batman-adv on top
@@ -42,6 +43,8 @@
 #   /etc/udev/rules.d/90-mesh-uplink.rules, /etc/avahi/avahi-daemon.conf, /etc/avahi/services/groupmesh.service
 #   /etc/tmpfiles.d/mesh.conf, /etc/sysctl.d/90-mesh.conf, /etc/modules-load.d/batman.conf
 #   /etc/resolv.conf (local dnsmasq; NetworkManager dns=none)
+# The first install keeps every file it replaces as <file>.mesh-bak and the
+# service states it changes in /etc/mesh/preinstall.state; uninstall restores both.
 # Runtime state: /etc/default/mesh (ID, MYIP, GROUP, MESH_IF, MESH_BSSID), /run/mesh/{up,uplink,gateway,warnings},
 #   /run/dnsmasq/upstream.conf (dnsmasq forwarders), /etc/hosts.mesh (names found via mDNS).
 
@@ -52,6 +55,10 @@ SELF=$(readlink -f "$0")
 TITLE="Raspberry Pi Mesh Configuration Tool (mesh-config)"
 WARN_FILE=/run/mesh/warnings      # warnings from the mesh scripts
 INTERACTIVE=0                     # 1 inside the menu
+# Existing files that install or the mesh scripts replace; kept as <file>.mesh-bak.
+MESH_REPLACED="/etc/avahi/avahi-daemon.conf /etc/caddy/Caddyfile /etc/resolv.conf /etc/hosts /etc/hostname /etc/hostapd/hostapd.conf"
+# Services whose boot state install changes.
+MESH_UNITS="dnsmasq hostapd caddy dhcpcd avahi-daemon"
 
 [ "$EUID" -eq 0 ] || exec sudo -E "$SELF" "$@"
 
@@ -190,6 +197,30 @@ write_system_files() (
   systemctl is-active --quiet NetworkManager \
     || fail "NetworkManager is not running"
   [ -f "$CONF" ] || : > "$CONF" || fail "cannot create $CONF"
+
+  # --- first install only: keep what is about to be replaced, and the boot
+  #     state of each service before its package is installed, for uninstall.
+  #     An install by an older mesh-config has already replaced it.
+  install -d /etc/mesh
+  if [ ! -f /etc/mesh/preinstall.state ]; then
+    if [ -f /etc/systemd/system/mesh.service ]; then
+      echo "# installed over an older mesh-config: no backups, service states unknown" > /etc/mesh/preinstall.state
+    else
+      {
+        # new=: did not exist, uninstall removes it
+        for f in $MESH_REPLACED; do
+          if [ -e "$f" ] || [ -L "$f" ]; then
+            [ -e "$f.mesh-bak" ] || cp -a "$f" "$f.mesh-bak"
+          else
+            echo "new=$f"
+          fi
+        done
+        for u in $MESH_UNITS; do echo "$u=$(systemctl is-enabled "$u" 2>/dev/null || true)"; done
+        echo "ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
+        echo "rp_filter=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo 0)"
+      } > /etc/mesh/preinstall.state
+    fi
+  fi
 
   echo "Installing packages..."
   # hostapd must not start with its stock config on installation.
@@ -960,6 +991,73 @@ EOF
   echo "System files written"
 )
 
+# Undo install: stop the mesh, remove every file install wrote, restore the
+# replaced files and the service states from before the first install.
+# Packages, users, /home/<id>, /var/www/mesh and mesh.conf stay.
+uninstall_mesh() (
+  [ -f /etc/systemd/system/mesh.service ] || [ -d /etc/mesh ] || { echo "mesh-config is not installed"; exit 0; }
+  echo "Stopping the mesh..."
+  if systemctl is-active --quiet mesh.service; then
+    systemctl stop mesh.service
+  elif [ -x /usr/local/sbin/mesh-down.sh ]; then
+    /usr/local/sbin/mesh-down.sh
+  fi
+  systemctl stop mesh-hosts.timer mesh-role-check.timer 'mesh-uplink@*.service' 2>/dev/null
+  systemctl disable mesh.service mesh-hosts.timer mesh-role-check.timer >/dev/null 2>&1
+  state=$(grep -v '^#' /etc/mesh/preinstall.state 2>/dev/null)
+
+  echo "Removing system files..."
+  rm -f /usr/local/sbin/mesh-up.sh /usr/local/sbin/mesh-down.sh /usr/local/sbin/mesh-uplink.sh \
+        /usr/local/sbin/mesh-role.sh /usr/local/sbin/mesh-hosts.sh /usr/local/sbin/mesh-config \
+        /etc/systemd/system/mesh.service /etc/systemd/system/mesh-uplink@.service \
+        /etc/systemd/system/mesh-role-check.service /etc/systemd/system/mesh-role-check.timer \
+        /etc/systemd/system/mesh-hosts.service /etc/systemd/system/mesh-hosts.timer \
+        /etc/systemd/system/caddy.service.d/mesh.conf \
+        /etc/NetworkManager/conf.d/99-mesh.conf /etc/NetworkManager/dispatcher.d/50-mesh-dns \
+        /etc/udev/rules.d/90-mesh-uplink.rules /etc/avahi/services/groupmesh.service \
+        /etc/tmpfiles.d/mesh.conf /etc/sysctl.d/90-mesh.conf /etc/modules-load.d/batman.conf \
+        /etc/dnsmasq.d/mesh.conf /etc/nftables.d/meshgw.nft /etc/hosts.mesh /etc/default/mesh \
+        /run/dnsmasq/upstream.conf
+  rmdir /etc/systemd/system/caddy.service.d 2>/dev/null
+  rm -rf /usr/local/lib/mesh /etc/mesh /run/mesh
+
+  for f in $MESH_REPLACED; do
+    if [ -e "$f.mesh-bak" ] || [ -L "$f.mesh-bak" ]; then
+      rm -f "$f"; mv "$f.mesh-bak" "$f"; echo "Restored $f"
+    elif grep -qx "new=$f" <<< "$state"; then
+      rm -f "$f"
+    elif [ "$f" = /etc/resolv.conf ]; then
+      rm -f "$f"   # NetworkManager writes it again on reload
+    elif [ -e "$f" ]; then
+      echo "No backup of $f; left as it is"
+    fi
+  done
+  [ -s /etc/hostname ] && hostnamectl set-hostname "$(cat /etc/hostname)"
+
+  systemctl daemon-reload
+  udevadm control --reload >/dev/null 2>&1
+  nmcli general reload >/dev/null 2>&1 || systemctl reload NetworkManager >/dev/null 2>&1
+  sysctl -q --system >/dev/null 2>&1
+  if [ -n "$state" ]; then
+    for u in $MESH_UNITS; do
+      case $(sed -n "s/^$u=//p" <<< "$state") in
+        enabled)  systemctl enable "$u" >/dev/null 2>&1; systemctl restart "$u" 2>/dev/null ;;
+        disabled|"") systemctl disable --now "$u" >/dev/null 2>&1 ;;   # "": not installed before
+        masked)   systemctl stop "$u" 2>/dev/null; systemctl mask "$u" >/dev/null 2>&1 ;;
+      esac
+    done
+    sysctl -qw "net.ipv4.ip_forward=$(sed -n 's/^ip_forward=//p' <<< "$state")" >/dev/null 2>&1
+    sysctl -qw "net.ipv4.conf.all.rp_filter=$(sed -n 's/^rp_filter=//p' <<< "$state")" >/dev/null 2>&1
+  else
+    echo "Service states from before the install are unknown; dnsmasq, avahi-daemon and caddy left as they are"
+  fi
+
+  echo
+  echo "mesh-config is uninstalled. Kept:"
+  echo "  packages: batctl hostapd dnsmasq avahi-daemon avahi-utils nftables iw bridge-utils caddy whiptail"
+  echo "  users created for node ids, their /home/<id>/public folders, /var/www/mesh and $CONF"
+)
+
 # USB gadget (dwc2 + g_ether) in the boot files, per usb_gadget.
 apply_usb_gadget() {
   local cfg=/boot/firmware/config.txt cmd=/boot/firmware/cmdline.txt
@@ -1179,12 +1277,20 @@ menu_ports() {
   return 0
 }
 
-# 6 Install: write or refresh the system files.
+# 6 Install: write or refresh the system files, or remove them.
 menu_install() {
-  local rc
-  yesno "Install system files and packages?" || return
-  clear; write_system_files; rc=$?
-  [ $rc -eq 0 ] || echo "Install failed (exit $rc)"
+  local rc choice
+  choice=$(whiptail --title "$TITLE" --menu "System files" 12 64 2 \
+      "1 Install"   "Install or refresh system files and packages" \
+      "2 Uninstall" "Remove system files, restore the originals" \
+      3>&1 1>&2 2>&3) || return
+  case ${choice%% *} in
+    1) yesno "Install system files and packages?" || return
+       clear; write_system_files; rc=$?
+       [ $rc -eq 0 ] || echo "Install failed (exit $rc)" ;;
+    2) yesno "Stop the mesh and remove all its system files? Packages, users and their folders stay." || return
+       clear; uninstall_mesh ;;
+  esac
   read -rp "Press Enter to continue"
 }
 
@@ -1253,7 +1359,7 @@ main_menu() {
       "3 Uplink"   "External network, access point or off" \
       "4 Radio"    "Ad-hoc name, channel, addresses" \
       "5 Ports"    "Ethernet bridge, USB gadget" \
-      "6 Install"  "Install or refresh system files" \
+      "6 Install"  "Install, refresh or remove system files" \
       "7 Wi-Fi"    "Join a Wi-Fi network (stops the mesh)" \
       "8 Status"   "Show status" \
       "9 Finish"   "Exit" \
@@ -1277,5 +1383,6 @@ main_menu() {
 case "${1:-}" in
   install) set_defaults; write_system_files; exit $? ;;
   status)  show_status ;;
+  uninstall) uninstall_mesh; exit $? ;;
   *)       main_menu ;;
 esac
