@@ -1,8 +1,8 @@
 # rpi_mesh_autodns
 
 A self-organising classroom mesh for Raspberry Pis: an open ad-hoc cell with batman-adv on
-the built-in radio, automatic names (`<id>.mesh`, `<group>.mesh`), every Pi's web folder
-reachable through every Pi, and a hot-pluggable second radio (ESP32-C5 via esp-hosted-linux)
+the built-in radio, one address for clients (`<group>.mesh`), every Pi's web folder
+reachable through it at `<group>.mesh/<id>/`, and a hot-pluggable second radio (ESP32-C5 via esp-hosted-linux)
 that either joins an external network and shares it with the mesh, or broadcasts the group's
 access point for laptops. Pis join and leave at any time; gateways appear and disappear on their own.
 
@@ -12,6 +12,7 @@ access point for laptops. Pis join and leave at any time; gateways appear and di
 sudo ./mesh-config.sh            # interactive menu (raspi-config style)
 sudo ./mesh-config.sh install    # write all system files non-interactively
 sudo ./mesh-config.sh status     # print status and exit
+sudo mesh-config update          # after install: update from GitHub if version.txt is newer; mesh.conf is kept
 ```
 
 In the menu: set the ID and group (1), install the system files (6), choose what the second

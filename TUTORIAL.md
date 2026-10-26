@@ -15,7 +15,7 @@ that is what the script's systemd units add at the end.
 
 ```
  laptop ──(Wi-Fi "demo-mesh" or an Ethernet cable)──┐
-                                                    │  br0  10.X.Y.1/8   dnsmasq · avahi · caddy
+                                                    │  br0  100.N.Y.1/10 dnsmasq · avahi · caddy
  other Pis ═══ ad-hoc cell "demo.mesh" ═══ wlan0 ───┤
                                              bat0 ──┘  batman-adv: routes between Pis, looks like one Ethernet
  internet ──(NetworkManager: eduroam, home Wi-Fi, PPPoE, ...)── wlan1 / eth0   → NAT gateway while it works
@@ -28,7 +28,7 @@ Seven layers, bottom up:
 | 1 | Radios talk to each other without an access point (ad-hoc / IBSS) | `iw` |
 | 2 | Multi-hop routing between Pis; the whole mesh behaves like one Ethernet switch | `batman-adv`, `batctl` |
 | 3 | A bridge so the Pi, its laptops and its access point all sit on that Ethernet, plus a stable address per Pi | `ip link`, `ip addr` |
-| 4 | Names: every Pi announces itself, every Pi resolves `<id>.mesh` | `avahi`, `dnsmasq` |
+| 4 | Names: every Pi announces itself and knows its peers; clients only resolve `<group>.mesh` | `avahi`, `dnsmasq` |
 | 5 | Web: each Pi serves its folder and proxies every other Pi's folder | `caddy` |
 | 6 | Uplink: a second radio either joins an external network (and the Pi becomes a gateway) or broadcasts the group access point | NetworkManager, `nftables`, `hostapd` |
 | 7 | Back to normal | the reverse of all of the above |
@@ -44,7 +44,7 @@ From the group name everything else is derived: address `demo.mesh`, ad-hoc cell
 ## 1. Packages and kernel settings
 
 ```bash
-sudo apt install batctl hostapd dnsmasq avahi-daemon avahi-utils nftables curl iw bridge-utils caddy
+sudo apt install batctl hostapd dnsmasq avahi-daemon avahi-utils iputils-arping nftables curl iw bridge-utils caddy
 sudo modprobe batman-adv
 echo batman-adv | sudo tee /etc/modules-load.d/batman.conf
 printf 'net.ipv4.ip_forward = 1\nnet.ipv4.conf.all.rp_filter = 0\n' | sudo tee /etc/sysctl.d/90-mesh.conf
@@ -82,13 +82,26 @@ from the radio's MAC address, which is unique and never changes:
 
 ```bash
 m=$(cat /sys/class/net/wlan0/address)        # e.g. b8:27:eb:12:4e:9a
-echo "10.$((0x${m:12:2})).$((0x${m:15:2})).1"   # -> 10.78.154.1
+echo "100.$((64 + 0x${m:12:2} % 64)).$((0x${m:15:2})).1"   # -> 100.78.154.1
 ```
 
-The last two bytes of the MAC become the second and third octet, so each Pi owns
-`10.X.Y.1` and can hand out `10.X.Y.10` to `.250` to its own laptops. Because any Pi can
-compute another Pi's address from its MAC, a gateway's address is known the moment
-batman-adv reports the gateway's MAC (step 9).
+The last two bytes of the MAC (X:Y) become the second and third octet, so each Pi owns
+`100.N.Y.1` (N = 64 + X mod 64) and can hand out `.10` to `.250` of that /24 to its own laptops.
+The mesh uses `100.64.0.0/10`, the shared address space reserved for carrier NAT: unlike
+`10.x`, campus networks such as eduroam and home routers do not use it, so the mesh never
+hides part of the network the Pi is connected to (Tailscale also uses it; do not run both).
+Because any Pi can compute another Pi's address from its MAC, a gateway's address is
+known the moment batman-adv reports the gateway's MAC (step 9).
+
+Two Pis can share the last MAC bits (about 1% for 20 Pis). Before using the address, ask
+the mesh whether anyone answers for it (step 6, once `br0` is up), and take the next
+candidate if so:
+
+```bash
+sudo arping -D -c 2 -w 3 -I br0 100.78.154.1 && echo free     # a reply = taken
+h=$(printf '%s/1' "$m" | md5sum)                                # candidate 1, 2, ...
+echo "100.$((64 + 0x${h:0:2} % 64)).$((0x${h:2:2})).1"
+```
 
 Ad-hoc cells merge only when they share the cell ID (BSSID). Derive one from the mesh
 name so every Pi with the same name computes the same cell ID; `02:` makes it a
@@ -144,40 +157,40 @@ sudo ip link add br0 type bridge
 sudo ip link set bat0 master br0
 sudo ip link set bat0 up
 sudo ip link set br0 up
-sudo ip addr add 10.78.154.1/8 dev br0           # the address from step 3
+sudo ip link set br0 address 02:27:eb:12:4e:9a   # fixed: the radio MAC with 02 in front
+sudo ip addr add 100.78.154.1/10 dev br0         # the address from step 3, after the arping check
 ```
 
 `bat0` is a virtual Ethernet interface: anything sent into it is routed hop by hop over
 the ad-hoc radio to the right Pi, and the Pis constantly measure link quality to pick
 routes. `br0` is a plain Linux bridge with `bat0` as its first port; later an access
 point and an Ethernet cable join the same bridge, so a laptop on any port is on the same
-LAN as every Pi. The `/8` mask makes all `10.X.Y.z` addresses one subnet.
+LAN as every Pi. The `/10` mask makes all `100.64.0.0` to `100.127.255.255` addresses one subnet.
 
-Now repeat steps 1 to 6 on Pi 2 (its own MAC gives it its own address, say `10.45.201.1`). Then:
+Now repeat steps 1 to 6 on Pi 2 (its own MAC gives it its own address, say `100.109.201.1`). Then:
 
 ```bash
 sudo batctl o          # originators: the other Pis, with link quality (TQ, 255 is perfect)
 sudo batctl n          # direct radio neighbours
-ping 10.45.201.1       # from pi1 to pi2
+ping 100.109.201.1       # from pi1 to pi2
 ```
 
 ## 7. Names: discovery and DNS
 
-Each Pi runs its own DNS server (dnsmasq) that knows the mesh names and forwards
+Each Pi runs its own DNS server (dnsmasq) that answers the group name and forwards
 everything else to the internet via whichever gateway exists. Write `/etc/dnsmasq.d/mesh.conf`
 (values for pi1):
 
 ```
 interface=br0
 bind-dynamic
-dhcp-range=10.78.154.10,10.78.154.250,255.0.0.0,10m
-dhcp-option=option:dns-server,10.78.154.1
-dhcp-option=option:router,10.78.154.1
+dhcp-range=100.78.154.10,100.78.154.250,255.192.0.0,10m
+dhcp-option=option:dns-server,100.78.154.1
+dhcp-option=option:router,100.78.154.1
 domain=mesh
 local=/mesh/
-expand-hosts
-addn-hosts=/etc/hosts.mesh
-address=/demo.mesh/10.78.154.1
+no-hosts
+address=/demo.mesh/100.78.154.1
 servers-file=/run/dnsmasq/upstream.conf
 no-resolv
 cache-size=1000
@@ -185,8 +198,8 @@ cache-size=1000
 
 - `interface=br0` plus `bind-dynamic`: serve the mesh side only, even if `br0` appears later.
 - `dhcp-range` ... `10m`: laptops attached to this Pi get an address from this Pi's block, with this Pi as router and DNS, on short leases so they re-learn quickly after roaming.
-- `domain=mesh`, `local=/mesh/`, `expand-hosts`: `.mesh` is ours; never ask the internet about it.
-- `addn-hosts=/etc/hosts.mesh`: the list of discovered Pis (built below).
+- `domain=mesh`, `local=/mesh/`: `.mesh` is ours; never ask the internet about it.
+- `no-hosts`: do not hand out `/etc/hosts`. Peer names (built below) live there for this Pi only, so clients never resolve `<id>.mesh`.
 - `address=/demo.mesh/...`: the group address always points at *this* Pi; whichever Pi you are attached to answers for the group.
 - `servers-file` + `no-resolv`: upstream DNS comes from one small file we control, not from `/etc/resolv.conf`.
 
@@ -228,18 +241,22 @@ sudo tee /etc/avahi/services/groupmesh.service <<'EOF'
   <service>
     <type>_groupmesh._tcp</type>
     <port>80</port>
+    <txt-record>mac=b8:27:eb:12:4e:9a</txt-record>
   </service>
 </service-group>
 EOF
 sudo systemctl restart avahi-daemon
 ```
 
-Build the name list from what avahi sees, and tell dnsmasq to reload it:
+Build the peer list from what avahi sees and put it in a block of this Pi's `/etc/hosts`
+(skipping this Pi itself). Caddy and the shell read `/etc/hosts`; dnsmasq does not (`no-hosts`):
 
 ```bash
-avahi-browse -trp _groupmesh._tcp | awk -F';' '$1=="=" && $3=="IPv4" {print $8, $4".mesh"}' | sort -u | sudo tee /etc/hosts.mesh
-sudo pkill -HUP -x dnsmasq
-ping pi2.mesh          # the Pi's resolver has "search mesh", so "ping pi2" works too
+avahi-browse -trp _groupmesh._tcp | awk -F';' '$1=="=" && $3=="IPv4" {m=$10; gsub(/"|mac=/,"",m); print $8, $4".mesh", m}' | sort -u | sudo tee /etc/hosts.mesh
+{ sed '/^# mesh-peers begin/,/^# mesh-peers end/d' /etc/hosts; echo '# mesh-peers begin'
+  awk -v me=pi1 '{n=$2; sub(/\.mesh$/,"",n); if (n != me) print $1"\t"$2"\t"n}' /etc/hosts.mesh
+  echo '# mesh-peers end'; } > /tmp/hosts && sudo cp /tmp/hosts /etc/hosts
+ping pi2.mesh          # or just "ping pi2"; works on the Pis, not on laptops
 ```
 
 The script runs this every minute; by hand you run it whenever a Pi joins or leaves.
@@ -255,15 +272,22 @@ echo '<h1>hello from pi1</h1>' | sudo tee /home/pi1/public/index.html
 sudo mkdir -p /var/www/mesh && echo '<h1>demo</h1><p>directory page</p>' | sudo tee /var/www/mesh/index.html
 ```
 
-`/etc/caddy/Caddyfile` (identical on every Pi; the three variables are filled in per node):
+`/etc/caddy/Caddyfile` (identical on every Pi; the three variables are filled in per node). Only `<group>.mesh` is served:
 
 ```
 {
   auto_https off
 }
 
-http://{$GROUP}.mesh, http://{$ID}.mesh, http://{$ID}.local, http://{$MYIP} {
+http://{$GROUP}.mesh {
   bind {$MYIP}
+  encode zstd gzip
+  # access log: journalctl -u caddy
+  log {
+    format console {
+      level_format upper
+    }
+  }
 
   redir /{$ID} /{$ID}/ 301
 
@@ -272,12 +296,17 @@ http://{$GROUP}.mesh, http://{$ID}.mesh, http://{$ID}.local, http://{$MYIP} {
     file_server browse
   }
 
+  # /<group>/ would proxy to this node itself; proxied requests are not proxied again
   @peer {
     path_regexp p ^/([a-z0-9]+)(/.*)?$
-    not path /{$ID} /{$ID}/*
+    not path /{$ID} /{$ID}/* /{$GROUP} /{$GROUP}/*
+    not header X-Mesh-Hop *
   }
   handle @peer {
-    reverse_proxy {re.p.1}.mesh:80
+    reverse_proxy {re.p.1}.mesh:80 {
+      header_up Host {$GROUP}.mesh
+      header_up X-Mesh-Hop 1
+    }
   }
 
   handle {
@@ -288,17 +317,18 @@ http://{$GROUP}.mesh, http://{$ID}.mesh, http://{$ID}.local, http://{$MYIP} {
 ```
 
 ```bash
-sudo env ID=pi1 GROUP=demo MYIP=10.78.154.1 caddy run --config /etc/caddy/Caddyfile
+sudo env ID=pi1 GROUP=demo MYIP=100.78.154.1 caddy run --config /etc/caddy/Caddyfile
 ```
 
-Reading it top to bottom: listen only on the mesh address; `/pi1/` is this Pi's folder
+Reading it top to bottom: listen only on the mesh address, compress text and log each request; `/pi1/` is this Pi's folder
 (`handle_path` strips the prefix so links inside the folder stay relative); any other
-`/<name>/` is proxied to `http://<name>.mesh:80` with the path unchanged, so that Pi
-serves its own folder; everything else is the directory page. From pi2:
+`/<name>/` is proxied to `http://<name>.mesh:80` (looked up in this Pi's `/etc/hosts`) with
+the path unchanged and `Host: <group>.mesh`, so that Pi serves its own folder; `/<group>/` and
+requests that were already proxied are never proxied again (no loops); everything else is the
+directory page. Any other host name or the bare IP gets an empty page. From pi2:
 
 ```bash
 curl http://demo.mesh/pi1/      # proxied by pi2 to pi1
-curl http://pi1.mesh/pi1/       # straight to pi1
 ```
 
 ## 9. The uplink radio
@@ -341,13 +371,15 @@ nmcli -g IP4.DNS device show wlan1 | tr '|' '\n' | sed 's/[[:space:]]//g; /^$/d;
 sudo pkill -HUP -x dnsmasq
 ```
 
-On every other Pi, batman-adv now lists the gateway. Compute its address from its MAC
-exactly as in step 3, route through it, and forward DNS to it:
+On every other Pi, batman-adv now lists the gateway. Look its MAC up in the peer list
+(`/etc/hosts.mesh`, step 7; a Pi that moved off its MAC address is only found there) or
+compute the address from the MAC as in step 3, route through it, and forward DNS to it:
 
 ```bash
 sudo batctl gwl                      # "*" marks the selected gateway; second column is its MAC
-sudo ip route replace default via 10.78.154.1 dev br0 metric 50
-echo 'server=10.78.154.1' | sudo tee /run/dnsmasq/upstream.conf
+awk '$3 == "b8:27:eb:12:4e:9a" {print $1}' /etc/hosts.mesh   # -> 100.78.154.1
+sudo ip route replace default via 100.78.154.1 dev br0 metric 50
+echo 'server=100.78.154.1' | sudo tee /run/dnsmasq/upstream.conf
 sudo pkill -HUP -x dnsmasq
 curl -sI http://detectportal.firefox.com/success.txt
 ```
@@ -359,7 +391,7 @@ the same way, including Ethernet or PPPoE on `eth0` (then just do not bridge `et
 
 ### 9b. Access point for laptops
 
-`/etc/hostapd/hostapd.conf` (pi1; the SSID and passphrase are the same on every AP Pi so laptops roam):
+`/etc/hostapd/hostapd.conf` (pi1; the SSID is the same on every AP Pi so laptops roam; the access point is open for now):
 
 ```
 interface=wlan1
@@ -373,10 +405,6 @@ channel=36
 ieee80211n=1
 ieee80211ac=1
 wmm_enabled=1
-wpa=2
-wpa_key_mgmt=WPA-PSK
-wpa_passphrase=demo.mesh
-rsn_pairwise=CCMP
 ```
 
 ```bash
@@ -385,7 +413,7 @@ sudo hostapd /etc/hostapd/hostapd.conf
 ```
 
 `bridge=br0` puts the access point on the mesh LAN, so a laptop that joins `demo-mesh`
-gets `10.78.154.x` from pi1's dnsmasq, resolves `demo.mesh` to pi1, and reaches every
+gets `100.78.154.x` from pi1's dnsmasq, resolves `demo.mesh` to pi1, and reaches every
 Pi's folder through it. Three ESP-Hosted facts: the driver must be built with
 `ap_support`; it has no automatic channel selection, so give each AP Pi its own channel
 from 36, 40, 44, 48 (the script hashes the ID: pi1 gets 36, pi2 gets 48); and the
