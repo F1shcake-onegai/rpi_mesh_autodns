@@ -237,11 +237,13 @@ sudo systemctl restart avahi-daemon
 Build the name list from what avahi sees, and tell dnsmasq to reload it:
 
 ```bash
-avahi-browse -trp _groupmesh._tcp | awk -F';' '$1=="=" && $3=="IPv4" {print $8, $4".mesh"}' | sort -u | sudo tee /etc/hosts.mesh
+avahi-browse -trp _groupmesh._tcp | awk -F';' '$1=="=" && $3=="IPv4" && $4 ~ /^[a-z0-9]+$/ {print $8, $4".mesh"}' | sort -u | sudo tee /etc/hosts.mesh
 sudo pkill -HUP -x dnsmasq
 ping pi2.mesh          # the Pi's resolver has "search mesh", so "ping pi2" works too
 ```
 
+Anyone on the open mesh can announce this service, so only names that are valid IDs
+(`[a-z0-9]+`) are taken; that keeps junk and markup out of DNS and the directory page.
 The script runs this every minute; by hand you run it whenever a Pi joins or leaves.
 
 ## 8. The web folder
@@ -250,7 +252,7 @@ Each student edits `/home/<id>/public`; every Pi serves its own folder and proxi
 
 ```bash
 sudo useradd -m -s /bin/bash pi1 && sudo passwd pi1
-sudo install -d -o pi1 -g pi1 -m 755 /home/pi1/public && sudo chmod 755 /home/pi1
+sudo install -d -o pi1 -g pi1 -m 755 /home/pi1/public && sudo chmod 711 /home/pi1
 echo '<h1>hello from pi1</h1>' | sudo tee /home/pi1/public/index.html
 sudo mkdir -p /var/www/mesh && echo '<h1>demo</h1><p>directory page</p>' | sudo tee /var/www/mesh/index.html
 ```
@@ -266,6 +268,8 @@ http://{$GROUP}.mesh, http://{$ID}.mesh, http://{$ID}.local, http://{$MYIP} {
   bind {$MYIP}
 
   redir /{$ID} /{$ID}/ 301
+  redir /{$GROUP} / 302
+  redir /{$GROUP}/* / 302
 
   handle_path /{$ID}/* {
     root * /home/{$ID}/public
@@ -275,9 +279,12 @@ http://{$GROUP}.mesh, http://{$ID}.mesh, http://{$ID}.local, http://{$MYIP} {
   @peer {
     path_regexp p ^/([a-z0-9]+)(/.*)?$
     not path /{$ID} /{$ID}/*
+    not header X-Mesh-Hop *
   }
   handle @peer {
-    reverse_proxy {re.p.1}.mesh:80
+    reverse_proxy {re.p.1}.mesh:80 {
+      header_up X-Mesh-Hop 1
+    }
   }
 
   handle {
@@ -294,7 +301,13 @@ sudo env ID=pi1 GROUP=demo MYIP=10.78.154.1 caddy run --config /etc/caddy/Caddyf
 Reading it top to bottom: listen only on the mesh address; `/pi1/` is this Pi's folder
 (`handle_path` strips the prefix so links inside the folder stay relative); any other
 `/<name>/` is proxied to `http://<name>.mesh:80` with the path unchanged, so that Pi
-serves its own folder; everything else is the directory page. From pi2:
+serves its own folder; everything else is the directory page.
+
+Two lines stop requests from going round in circles. `<group>.mesh` always points at the
+Pi you ask, so `/demo/` would be proxied to itself forever; it is redirected to the
+directory page instead (which is also why an ID may not equal the group name). And a
+proxied request carries `X-Mesh-Hop`, so the Pi that receives it serves it or answers 404,
+but never forwards it again. From pi2:
 
 ```bash
 curl http://demo.mesh/pi1/      # proxied by pi2 to pi1
@@ -417,6 +430,17 @@ sudo pkill -HUP -x dnsmasq                          # dnsmasq now forwards to th
 | 9a | `mesh-role.sh` every two minutes and on every NetworkManager event |
 | 9b | `mesh-uplink.sh` from `mesh-uplink@IFACE.service`, started by udev when the radio is plugged in |
 | 10 | `mesh-down.sh`, run as `ExecStopPost` so it also runs when a start failed half way |
+
+Wired ports (5 Ports): `bridge_eth0=yes` puts eth0 on `br0`, so a PC on a cable joins the
+mesh and gets an address from the Pi. Only do that with a cable to one PC: every Pi's
+DHCP server would answer the whole network behind a wall jack or router. `eth0_dhcp=no`
+keeps eth0 bridged but drops DHCP at that port (a bridge-family nftables table, because
+dnsmasq only sees `br0`); devices there then need fixed addresses.
+
+Undoing the script (6 Install > Uninstall, or `sudo ./mesh-config.sh uninstall`): the
+first install keeps every file it replaces as `<file>.mesh-bak` and records the boot
+state of each service it changes; uninstall stops the mesh, removes everything install
+wrote and restores those. Packages, the node users and their folders stay.
 
 Plus the things a tutorial skips: every error shown with the journal instead of being
 lost, warnings collected for the status page, DNS kept working when dnsmasq is down,
