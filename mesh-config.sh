@@ -31,12 +31,13 @@
 #   ap_ssid        access point name (default <group>-mesh)   ap_psk   passphrase (default <group>.mesh)
 #   ap_channel     auto (36/40/44/48 picked from the id) or a fixed channel
 #   bridge_eth0    yes/no: bridge eth0 into the mesh     usb_gadget   yes/no: USB-C gadget port
+#   eth0_dhcp      yes/no: hand out addresses through a bridged eth0 (no: devices there need fixed addresses)
 #
 # Files written by install (6 Install):
 #   /usr/local/sbin/mesh-{up,down,uplink,role,hosts}.sh and /usr/local/lib/mesh/common.sh
 #   /etc/systemd/system/mesh.service, mesh-uplink@.service, mesh-role-check.{service,timer},
 #     mesh-hosts.{service,timer}, caddy.service.d/mesh.conf
-#   /etc/mesh/*.tpl (dnsmasq, hostapd and nftables templates), /etc/caddy/Caddyfile
+#   /etc/mesh/*.tpl (dnsmasq, hostapd and nftables templates), /etc/mesh/meshdhcp.nft, /etc/caddy/Caddyfile
 #   /etc/NetworkManager/conf.d/99-mesh.conf, /etc/NetworkManager/dispatcher.d/50-mesh-dns
 #   /etc/udev/rules.d/90-mesh-uplink.rules, /etc/avahi/avahi-daemon.conf, /etc/avahi/services/groupmesh.service
 #   /etc/tmpfiles.d/mesh.conf, /etc/sysctl.d/90-mesh.conf, /etc/modules-load.d/batman.conf
@@ -172,6 +173,7 @@ set_defaults() {
   cfg_default mesh_channel 6
   cfg_default mesh_prefix 10
   cfg_default bridge_eth0 no
+  cfg_default eth0_dhcp  yes
   cfg_default usb_gadget no
 }
 
@@ -383,6 +385,21 @@ table inet meshgw {
 }
 EOF
 
+  # --- DHCP filter for a bridged eth0 (eth0_dhcp=no): dnsmasq only sees br0,
+  #     so requests in and offers out are dropped at the bridge port
+  cat > /etc/mesh/meshdhcp.nft <<'EOF'
+table bridge meshdhcp {
+  chain pre {
+    type filter hook prerouting priority 0; policy accept;
+    iifname "eth0" udp dport 67 drop
+  }
+  chain post {
+    type filter hook postrouting priority 0; policy accept;
+    oifname "eth0" udp sport 67 drop
+  }
+}
+EOF
+
   # --- avahi
   cat > /etc/avahi/avahi-daemon.conf <<'EOF'
 [server]
@@ -552,6 +569,11 @@ ip link set bat0 master br0
 ip link set bat0 up
 ip link set br0 up
 ip addr replace "$MYIP/8" dev br0
+# loaded before eth0 joins br0, so no offer slips through
+nft delete table bridge meshdhcp 2>/dev/null || true
+if [[ " $ports " == *" eth0 "* ]] && [ "${eth0_dhcp:-yes}" = no ]; then
+  nft -f "$TPL/meshdhcp.nft" || warn "cannot block DHCP on eth0"
+fi
 for p in $ports; do
   { ip link set "$p" master br0 && ip link set "$p" up; } || warn "cannot add $p to br0"
 done
@@ -609,6 +631,7 @@ rm -f "$RUN/up"
 systemctl stop 'mesh-uplink@*.service' 2>/dev/null
 systemctl stop mesh-role-check.timer mesh-hosts.timer hostapd caddy avahi-daemon 2>/dev/null
 nft delete table inet meshgw 2>/dev/null
+nft delete table bridge meshdhcp 2>/dev/null
 rm -f "$RUN/uplink" "$RUN/gateway"
 
 [ -n "$MESH_IF" ] && batctl if del "$MESH_IF" 2>/dev/null
@@ -1139,14 +1162,19 @@ menu_radio() {
 # 5 Ports: wired mesh ports (Ethernet bridge, USB gadget).
 menu_ports() {
   local sel
-  sel=$(whiptail --title "$TITLE" --checklist "Select wired mesh ports" 12 60 2 \
-      "eth0" "Ethernet port"             "$([ "$(cfg_get bridge_eth0)" = yes ] && echo ON || echo OFF)" \
-      "usb"  "USB gadget (needs reboot)" "$([ "$(cfg_get usb_gadget)" = yes ] && echo ON || echo OFF)" \
+  sel=$(whiptail --title "$TITLE" --checklist "Select wired mesh ports. Keep DHCP on for a cable to one PC; never bridge eth0 into a shared network" 14 72 3 \
+      "eth0" "Ethernet port"               "$([ "$(cfg_get bridge_eth0)" = yes ] && echo ON || echo OFF)" \
+      "dhcp" "Addresses for devices on eth0" "$([ "$(cfg_get eth0_dhcp)" != no ] && echo ON || echo OFF)" \
+      "usb"  "USB gadget (needs reboot)"   "$([ "$(cfg_get usb_gadget)" = yes ] && echo ON || echo OFF)" \
       3>&1 1>&2 2>&3) || return
-  [[ $sel == *eth0* ]] && cfg_set bridge_eth0 yes || cfg_set bridge_eth0 no
-  [[ $sel == *usb* ]]  && cfg_set usb_gadget yes  || cfg_set usb_gadget no
+  # whiptail returns the quoted tags: "eth0" "dhcp"
+  [[ $sel == *'"eth0"'* ]] && cfg_set bridge_eth0 yes || cfg_set bridge_eth0 no
+  [[ $sel == *'"dhcp"'* ]] && cfg_set eth0_dhcp yes   || cfg_set eth0_dhcp no
+  [[ $sel == *'"usb"'* ]]  && cfg_set usb_gadget yes  || cfg_set usb_gadget no
   apply_usb_gadget || return
   msg "Port settings saved"
+  mesh_active && yesno "Restart the mesh now?" && { clear; run_checked systemctl restart mesh.service && report_mesh_state; }
+  return 0
 }
 
 # 6 Install: write or refresh the system files.
@@ -1191,6 +1219,7 @@ show_status() {
     echo "Mesh radio: ${mif:-none}  $(iw dev "${mif:-none}" link 2>/dev/null | head -1)"
     echo "Uplink radio: ${uif:-none} (uplink_if=$(cfg_get uplink_if) role=$(cfg_get uplink) profile=$(cfg_get uplink_profile)) mesh-uplink@${uif:-?}: $(systemctl is-active "mesh-uplink@${uif:-none}" 2>/dev/null)"
     [ "$(systemctl is-active hostapd 2>/dev/null)" = active ] && echo "Access point: '$(sed -n 's/^ssid=//p' /etc/hostapd/hostapd.conf 2>/dev/null)' channel $(sed -n 's/^channel=//p' /etc/hostapd/hostapd.conf 2>/dev/null), clients: $(iw dev "${uif:-none}" station dump 2>/dev/null | grep -c '^Station') of 8"
+    echo "eth0: bridged=$(cfg_get bridge_eth0) dhcp=$(cfg_get eth0_dhcp)$(nft list table bridge meshdhcp >/dev/null 2>&1 && echo ' (DHCP blocked at eth0)')"
     if [ -n "$gw" ]; then echo "Gateway: on via $gw ($(nmcli -g GENERAL.CONNECTION device show "$gw" 2>/dev/null))"; else echo "Gateway: off"; fi
     echo; echo "Interfaces (NetworkManager view):"; nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null | grep -v '^lo:'
     echo; echo "Addresses:"; ip -4 -br addr 2>/dev/null
