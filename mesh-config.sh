@@ -209,7 +209,7 @@ write_system_files() (
   systemctl unmask hostapd >/dev/null 2>&1 || true
 
   install -d /etc/mesh /usr/local/lib/mesh /etc/nftables.d /etc/dnsmasq.d /etc/avahi/services /etc/hostapd \
-             /etc/systemd/system/caddy.service.d /etc/NetworkManager/conf.d /etc/NetworkManager/dispatcher.d \
+             /etc/caddy /etc/systemd/system/caddy.service.d /etc/NetworkManager/conf.d /etc/NetworkManager/dispatcher.d \
              /etc/udev/rules.d /etc/tmpfiles.d /var/www/mesh /usr/local/sbin /run/mesh /run/dnsmasq
   # Files from earlier layouts.
   rm -f /etc/dnsmasq.d/mesh.conf.tpl /etc/hostapd/hostapd.conf.tpl /etc/wpa_supplicant/wpa_supplicant-wlan1.conf.tpl \
