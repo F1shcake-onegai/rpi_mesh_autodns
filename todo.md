@@ -21,6 +21,9 @@ an iPhone. Full page (5.2 MB) loaded in ~13 s.
 - [ ] **Encryption (later)**: the access point is open and the ad-hoc mesh is
       open, on purpose, until the network and encryption design is decided. Do not
       ask about a password before then. Leftover: `ap_psk` in mesh.conf is unused.
+- [ ] **Never host to eduroam**: do not try to host to eduroam via wlan1, eth0 or any
+      other uplink; mesh services (DHCP, DNS, web) never answer on it. For personal
+      PCs or routers on the uplink, let the user choose whether to host there.
 - [ ] **Peer status page**: interactive page at `http://<group>.mesh/` showing which
       peers are online (today: static list rebuilt by `mesh-hosts.sh` every minute
       in `/var/www/mesh/index.html`).
