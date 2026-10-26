@@ -416,18 +416,25 @@ http://{$GROUP}.mesh, http://{$ID}.mesh, http://{$ID}.local, http://{$MYIP} {
   bind {$MYIP}
 
   redir /{$ID} /{$ID}/ 301
+  # <group>.mesh is this node; proxying /<group>/ would loop
+  redir /{$GROUP} / 302
+  redir /{$GROUP}/* / 302
 
   handle_path /{$ID}/* {
     root * /home/{$ID}/public
     file_server browse
   }
 
+  # a request another node already forwarded is never forwarded again
   @peer {
     path_regexp p ^/([a-z0-9]+)(/.*)?$
     not path /{$ID} /{$ID}/*
+    not header X-Mesh-Hop *
   }
   handle @peer {
-    reverse_proxy {re.p.1}.mesh:80
+    reverse_proxy {re.p.1}.mesh:80 {
+      header_up X-Mesh-Hop 1
+    }
   }
 
   handle {
@@ -464,6 +471,7 @@ load_conf
 ID=${id:-}; [ -n "$ID" ] || fail "id not set in $CONF"
 [[ $ID =~ ^[a-z0-9]+$ ]]    || fail "invalid id '$ID'"
 [[ $GROUP =~ ^[a-z0-9]+$ ]] || fail "invalid group '$GROUP'"
+[ "$ID" != "$GROUP" ]       || fail "id and group must differ ('$ID')"
 PFX=${mesh_prefix:-10}
 UPLINK=${uplink:-ap}
 MESH_ID=${mesh_id:-$GROUP.mesh}
@@ -952,6 +960,7 @@ menu_identity() {
   group=$(ask "Enter the group name (same on all nodes)" "$(cfg_get group)") || return
   group=$(echo "$group" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9')
   [ -n "$group" ] || group=group
+  [ "$id" != "$group" ] || { msg "ID and group name must differ"; return; }
   display=$(ask "Enter a display name (optional)" "$(cfg_get display)") || return
   cfg_set id "$id"; cfg_set group "$group"; cfg_set display "$display"
   if id -u "$id" >/dev/null 2>&1; then
