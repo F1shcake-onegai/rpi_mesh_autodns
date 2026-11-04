@@ -1,5 +1,39 @@
 # Changelog
 
+## 20261104+01
+
+Update every Pi of a group together (`sudo mesh-config update`, then restart the mesh): the
+ad-hoc cell name changes, and a Pi on the old name forms a separate mesh until it is updated.
+
+### Added
+- The second radio's capabilities are read from `iw phy`: access point mode, and the channels
+  it may transmit on (2.4 GHz 1/6/11 and non-DFS 5 GHz 36/40/44/48; a channel marked disabled,
+  no IR or radar detection is not used). The access point role works on 2.4 GHz-only radios
+  such as USB dongles (for example the RTL8192EU), not only on the 5 GHz ESP32-C5.
+- `ap_channel=auto` picks 36/40/44/48 by node ID when the radio can use them (the same
+  channel as before), else the 2.4 GHz channel farthest from `mesh_channel`: 1 or 11 by node
+  ID with the mesh on 6, 11 with the mesh on 1, 1 with the mesh on 11.
+- Status (8) shows, for each second radio, whether it can be an access point and its usable channels.
+- Warnings `<if> cannot run an access point (no AP mode); uplink role not applied` and
+  `<if> cannot run an access point on channel <n> (usable: ...); uplink role not applied`.
+  The radio is checked before it is taken from NetworkManager, so a refused role leaves it
+  with NetworkManager instead of idle; the warning is given once, not every two minutes.
+- Tutorial: how to read a radio's modes and usable channels; 2.4 GHz access point settings;
+  the two new warnings in the troubleshooting table.
+
+### Changed
+- Default ad-hoc cell name `<group>-pis` (was `<group>.mesh`, the same text as the web
+  address) and default access point SSID `<group>-ap` (was `<group>-mesh`, one character away
+  from the cell name). The web address stays `<group>.mesh`. A `mesh.conf` that stored the
+  old defaults explicitly follows the new ones; custom names stay.
+- The hostapd template takes `hw_mode` (a or g) and `ieee80211ac` (1 or 0) from the chosen
+  channel; it was fixed to 5 GHz, so hostapd failed on 2.4 GHz-only radios with
+  `Could not determine operating frequency`.
+- 3 Uplink: a radio without access point mode is not offered the access point role; the
+  channel list shows only the channels the radio can use, marks the mesh channel and shows
+  which channel `auto` picks. Without the radio attached, all channels are listed and
+  `mesh-uplink.sh` checks when the radio appears.
+
 ## 20261028+1
 
 ### Added

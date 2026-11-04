@@ -1,10 +1,15 @@
 # rpi_mesh_autodns
 
-A self-organising classroom mesh for Raspberry Pis: an open ad-hoc cell with batman-adv on
-the built-in radio, one address for clients (`<group>.mesh`), every Pi's web folder
-reachable through it at `<group>.mesh/<id>/`, and a hot-pluggable second radio (ESP32-C5 via esp-hosted-linux)
-that either joins an external network and shares it with the mesh, or broadcasts the group's
-access point for laptops. Pis join and leave at any time; gateways appear and disappear on their own.
+A self-organising classroom mesh for Raspberry Pis: an open ad-hoc cell (`<group>-pis`) with
+batman-adv on the built-in radio, one address for clients (`<group>.mesh`), every Pi's web folder
+reachable through it at `<group>.mesh/<id>/`, and a hot-pluggable second radio (ESP32-C5 via
+esp-hosted-linux, or a USB Wi-Fi dongle) that either joins an external network and shares it with
+the mesh, or broadcasts the group's access point for laptops (`<group>-ap`). Pis join and leave at
+any time; gateways appear and disappear on their own.
+
+The access point runs on 5 GHz when the second radio can, else on 2.4 GHz away from the mesh
+channel; a radio without access point mode is not offered the role. Status (8) shows what each
+second radio can do.
 
 ## Quick start
 

@@ -14,9 +14,9 @@ that is what the script's systemd units add at the end.
 ## 0. The picture
 
 ```
- laptop ──(Wi-Fi "demo-mesh" or an Ethernet cable)──┐
+ laptop ──(Wi-Fi "demo-ap" or an Ethernet cable)────┐
                                                     │  br0  100.N.Y.1/10 dnsmasq · avahi · caddy
- other Pis ═══ ad-hoc cell "demo.mesh" ═══ wlan0 ───┤
+ other Pis ═══ ad-hoc cell "demo-pis" ════ wlan0 ───┤
                                              bat0 ──┘  batman-adv: routes between Pis, looks like one Ethernet
  internet ──(NetworkManager: eduroam, home Wi-Fi, PPPoE, ...)── wlan1 / eth0   → NAT gateway while it works
 ```
@@ -38,8 +38,10 @@ a root shell, and optionally an ESP32-C5 running esp-hosted-linux as the second 
 The built-in radio (brcmfmac) does ad-hoc but not 802.11s, which is why this design is ad-hoc.
 
 Throughout the examples: Pi 1 has ID `pi1`, Pi 2 has ID `pi2`, the group is `demo`.
-From the group name everything else is derived: address `demo.mesh`, ad-hoc cell name
-`demo.mesh`, access point `demo-mesh`.
+From the group name everything else is derived: address `demo.mesh` (what people type),
+ad-hoc cell name `demo-pis` (only the Pis join it), access point `demo-ap` (what laptops
+and phones join). The cell and access point names are visible in Wi-Fi scans; the
+suffixes say which one is meant for people.
 
 ## 1. Packages and kernel settings
 
@@ -69,15 +71,16 @@ ip -d link show wlan0 | grep -o 'maxmtu [0-9]*'
 ```
 
 The mode list must contain `IBSS`. On Pi 4/5 it also contains `AP` and `managed` but
-**not** `mesh point`, so 802.11s is not an option on this radio. `maxmtu 1500` means the
+**not** `mesh point`, so 802.11s is not an option on this radio. For a second radio that
+should be an access point (step 9b), the list must contain `AP`. `maxmtu 1500` means the
 radio cannot carry batman-adv's preferred 1532-byte frames; batman-adv then fragments
 by itself, which costs a little throughput and nothing else.
 
 ## 3. Pick names and compute the addresses
 
 Decide the group (shared by every Pi) and the ID (hostname, user, folder, DNS name).
-Both are lowercase letters and digits only: the group at most 27 characters (so `<group>-mesh`
-fits an SSID), the ID at most 63 with at least one letter (a hostname `useradd` accepts), and
+Both are lowercase letters and digits only: the group at most 27 characters (so `<group>-pis`
+fits an SSID, at most 32 bytes), the ID at most 63 with at least one letter (a hostname `useradd` accepts), and
 the ID must differ from the group (step 8 says why).
 
 Every Pi needs a unique, stable mesh address without a central DHCP server. Derive it
@@ -111,8 +114,8 @@ name so every Pi with the same name computes the same cell ID; `02:` makes it a
 locally administered MAC that cannot collide with real hardware:
 
 ```bash
-printf '02:%s\n' "$(printf %s demo.mesh | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*/\1:\2:\3:\4:\5/')"
-# -> 02:0e:87:37:df:c9
+printf '02:%s\n' "$(printf %s demo-pis | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*/\1:\2:\3:\4:\5/')"
+# -> 02:27:79:d9:13:ce
 ```
 
 Set the hostname to the ID so mDNS announces the right name later:
@@ -145,8 +148,8 @@ sudo iw dev wlan0 set type ibss
 sudo ip link set wlan0 mtu 1532 || true          # refused on Pi radios, see step 2
 sudo ip link set wlan0 up
 iw dev wlan0 info | grep type                     # must say "type IBSS"
-sudo iw dev wlan0 ibss join demo.mesh 2437 fixed-freq 02:0e:87:37:df:c9
-sleep 5; iw dev wlan0 link                        # "Joined IBSS 02:0e:87:37:df:c9 (on wlan0)"
+sudo iw dev wlan0 ibss join demo-pis 2437 fixed-freq 02:27:79:d9:13:ce
+sleep 5; iw dev wlan0 link                        # "Joined IBSS 02:27:79:d9:13:ce (on wlan0)"
 ```
 
 2437 MHz is channel 6 (1 is 2412, 11 is 2462). Name, channel and cell ID must be
@@ -412,13 +415,24 @@ the same way, including Ethernet or PPPoE on `eth0` (then just do not bridge `et
 
 ### 9b. Access point for laptops
 
+First check what the radio can do. `AP` must be among its modes, and an access point may
+only use a channel the radio has and the Wi-Fi country allows it to start transmitting on:
+
+```bash
+iw phy "$(cat /sys/class/net/wlan1/phy80211/name)" info | sed -n '/Supported interface modes/,/Band 1/p'
+iw phy "$(cat /sys/class/net/wlan1/phy80211/name)" info | grep -E '\* (2412|2437|2462|5180|5200|5220|5240)(\.0)? MHz'
+```
+
+A channel line ending in `(disabled)`, `(no IR)` or `(radar detection)` is not usable for an
+access point; no 5 GHz lines at all means a 2.4 GHz-only radio (many USB dongles).
+
 `/etc/hostapd/hostapd.conf` (pi1; the SSID is the same on every AP Pi so laptops roam; the access point is open for now):
 
 ```
 interface=wlan1
 bridge=br0
 driver=nl80211
-ssid=demo-mesh
+ssid=demo-ap
 country_code=CA
 ieee80211d=1
 hw_mode=a
@@ -428,18 +442,28 @@ ieee80211ac=1
 wmm_enabled=1
 ```
 
+That is 5 GHz. Prefer it when the radio can: the mesh runs on 2.4 GHz, and a 2.4 GHz access
+point a few centimetres from the mesh radio drowns out its reception even on another
+channel. On a 2.4 GHz-only radio use `hw_mode=g`, `ieee80211ac=0` and the channel farthest
+from the mesh: 1 or 11 when the mesh is on 6.
+
 ```bash
 sudo nmcli device set wlan1 managed no
 sudo hostapd /etc/hostapd/hostapd.conf
 ```
 
 `bridge=br0` puts the access point on the mesh LAN. All Pis share that LAN, so a laptop that
-joins `demo-mesh` gets its address, DNS server and router from whichever Pi's dnsmasq answers
+joins `demo-ap` gets its address, DNS server and router from whichever Pi's dnsmasq answers
 first. That can be pi1 or any other Pi. If pi2 answers, the laptop gets an address in pi2's
-range, and `demo.mesh` resolves to pi2. Either way it reaches every Pi's folder. Three ESP-Hosted facts: the driver must be built with
-`ap_support`; it has no automatic channel selection, so give each AP Pi its own channel
-from 36, 40, 44, 48 (the script hashes the ID: pi1 gets 36, pi2 gets 48); and the
-firmware accepts at most 8 clients per radio.
+range, and `demo.mesh` resolves to pi2. Either way it reaches every Pi's folder.
+
+The script reads the same `iw` output: it refuses the access point role on a radio without
+`AP` mode (the radio stays with NetworkManager, and a warning says why), and with
+`ap_channel=auto` it picks 36, 40, 44 or 48 by hashing the ID (pi1 gets 36, pi2 gets 48)
+when the radio can use them, else 1 or 11 by the same hash (pi1 gets 1, pi2 gets 11 with
+the mesh on 6). Three ESP-Hosted facts: the driver must be built with `ap_support`
+(otherwise it lists no `AP` mode); it has no automatic channel selection, hence the fixed
+channel per Pi; and the firmware accepts at most 8 clients per radio.
 
 ## 10. Back to normal
 
@@ -515,3 +539,5 @@ Messages from `mesh-config.sh`:
 | `caddy.service does not read /etc/caddy/Caddyfile` | Caddy was installed without `apt`, so it has no service, or its service reads a different config file. | Set Caddy up as a service with Caddy's [Manual Installation](https://caddyserver.com/docs/running#manual-installation) guide, with `--config /etc/caddy/Caddyfile` in `ExecStart`. Run `sudo systemctl daemon-reload`, then run `./mesh-config.sh install` again. |
 | `/etc/caddy does not exist` | Caddy was installed without `apt`, and the folder for its config file was never created. | Run `sudo mkdir /etc/caddy`, then run `./mesh-config.sh install` again. |
 | `ID <id> is already used by another node on the mesh` | Another Pi on the mesh already uses this ID. | Choose a different ID in the menu (Identity), then restart the mesh. |
+| `<if> cannot run an access point (no AP mode); uplink role not applied` | The second radio does not support access point mode, for example an esp-hosted driver built without AP support. The radio stays with NetworkManager. | Rebuild the esp-hosted driver with `CONFIG_AP_SUPPORT=y`, use another radio, or choose an external network or off (3 Uplink). |
+| `<if> cannot run an access point on channel <n> (usable: ...); uplink role not applied` | The fixed `ap_channel` is one the radio does not have (for example 5 GHz on a 2.4 GHz-only dongle) or may not transmit on in this Wi-Fi country; `usable: none` means no channel at all. | Choose `auto` or a listed channel (3 Uplink); check the Wi-Fi country (`raspi-config`, Localisation). |

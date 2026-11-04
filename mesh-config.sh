@@ -11,9 +11,10 @@
 #
 # Design:
 #   mesh radio     built-in Wi-Fi, open ad-hoc (IBSS) cell, batman-adv on top
-#   uplink radio   second Wi-Fi (ESP32-C5, esp-hosted-linux), role per node:
+#   uplink radio   second Wi-Fi (ESP32-C5 via esp-hosted-linux, or a USB dongle), role per node:
 #                    external  NetworkManager connection; node is a gateway while online
-#                    ap        group access point, same SSID on every AP node
+#                    ap        group access point, same SSID on every AP node; 5 GHz when
+#                              the radio can, else 2.4 GHz (radios without AP mode refuse it)
 #   names          clients resolve <group>.mesh only; peers (avahi) go to this Pi's /etc/hosts
 #   web            caddy serves <group>.mesh: /home/<id>/public, other nodes proxied at /<id>/
 #   hot plug       udev starts and stops the uplink role with the radio
@@ -27,12 +28,14 @@
 #   group          shared name of this mesh, address <group>.mesh (default: group)
 #   display        optional display name
 #   mesh_if        built-in radio: auto (the brcmfmac one) or an interface name
-#   mesh_id        ad-hoc network name (default <group>.mesh); the cell id is derived from it
+#   mesh_id        ad-hoc network name (default <group>-pis); the cell id is derived from it
 #   mesh_channel   2.4 GHz channel 1, 6 or 11
 #   uplink_if      uplink radio: auto (first non-brcmfmac Wi-Fi interface) or a name
 #   uplink         external | ap | off               uplink_profile  NetworkManager profile name or auto
-#   ap_ssid        access point name (default <group>-mesh); the access point is open for now
-#   ap_channel     auto (36/40/44/48 picked from the id) or a fixed channel
+#   ap_ssid        access point name (default <group>-ap); the access point is open for now
+#   ap_channel     auto or a fixed channel. auto: 36/40/44/48 picked from the id when the
+#                  radio can use them, else the 2.4 GHz channel (1/6/11) farthest from
+#                  mesh_channel (1 or 11 picked from the id when the mesh is on 6)
 #   bridge_eth0    yes/no: bridge eth0 into the mesh     usb_gadget   yes/no: USB-C gadget port
 #   eth0_dhcp      yes/no: hand out addresses through a bridged eth0 (no: devices there need fixed addresses)
 #
@@ -119,11 +122,65 @@ cfg_default() { [ -n "$(cfg_get "$1")" ] || cfg_set "$1" "$2"; }
 cfg_set_or_follow() { if [ "$2" = "$3" ]; then cfg_set "$1" ""; else cfg_set "$1" "$2"; fi; }
 
 # Names derived from the group when not set explicitly:
-#   group_name   the group ("group" if unset)      mesh_name     ad-hoc network name, <group>.mesh
-#   ap_ssid_name access point SSID, <group>-mesh
-group_name()   { local g; g=$(cfg_get group); echo "${g:-group}"; }
-mesh_name()    { local v; v=$(cfg_get mesh_id); echo "${v:-$(group_name).mesh}"; }
-ap_ssid_name() { local v; v=$(cfg_get ap_ssid); echo "${v:-$(group_name)-mesh}"; }
+#   group_name   the group ("group" if unset)
+#   mesh_name    ad-hoc network name, <group>-pis (only the Pis join it)
+#   ap_ssid_name access point SSID, <group>-ap (laptops and phones join it)
+# The web address stays <group>.mesh. Both suffixes keep a 27-character group within
+# the 32-byte SSID limit. mesh-up.sh and mesh-uplink.sh derive the same defaults.
+group_name()        { local g; g=$(cfg_get group); echo "${g:-group}"; }
+default_mesh_name() { echo "$(group_name)-pis"; }
+default_ap_ssid()   { echo "$(group_name)-ap"; }
+mesh_name()         { local v; v=$(cfg_get mesh_id); echo "${v:-$(default_mesh_name)}"; }
+ap_ssid_name()      { local v; v=$(cfg_get ap_ssid); echo "${v:-$(default_ap_ssid)}"; }
+
+# ---- uplink radio capabilities. Used by the menu and, copied into common.sh by
+# install (declare -f), by mesh-uplink.sh. They read "iw phy <phy> info".
+
+# Can interface $1 run an access point ("AP" among its supported interface modes)?
+# An esp-hosted driver built without AP support does not list it.
+radio_can_ap() {
+  local phy
+  phy=$(cat "/sys/class/net/$1/phy80211/name" 2>/dev/null) || return 1
+  iw phy "$phy" info 2>/dev/null | awk '
+    /Supported interface modes:/ { m = 1; next }
+    m && /^[[:space:]]+\* / { if ($2 == "AP") found = 1; next }
+    m { m = 0 }
+    END { exit !found }'
+}
+# Access point channels interface $1 may use, one per line: the 2.4 GHz channels
+# 1/6/11 and the non-DFS 5 GHz channels 36/40/44/48 that the radio has and that the
+# regulatory domain allows to transmit on (not disabled, no IR or radar detection).
+radio_ap_channels() {
+  local phy
+  phy=$(cat "/sys/class/net/$1/phy80211/name" 2>/dev/null) || return 1
+  iw phy "$phy" info 2>/dev/null | awk '
+    BEGIN { split("2412 1 2437 6 2462 11 5180 36 5200 40 5220 44 5240 48", a, " ")
+            for (i = 1; i < 14; i += 2) want[a[i]] = a[i + 1] }
+    /^[[:space:]]+\* [0-9.]+ MHz \[/ {
+      f = int($2)
+      if (!(f in want) || $0 ~ /disabled|no IR|passive scan|radar detection/) next
+      print want[f] }'
+}
+# Channel for ap_channel=auto on interface $1 (node ID $2, mesh channel $3): one of
+# 36/40/44/48 by node ID when the radio can use them; else the usable 2.4 GHz channel
+# farthest from the mesh channel, ties (1 and 11 around 6) broken by node ID. Prints
+# nothing when the radio has no usable channel.
+auto_ap_channel() {
+  local chans h c d best=-1
+  local -a pick=()
+  chans=$(radio_ap_channels "$1") || return 0
+  h=$((0x$(printf %s "$2" | md5sum | cut -c1-2)))
+  for c in $chans; do [ "$c" -ge 36 ] && pick+=("$c"); done
+  if [ ${#pick[@]} -gt 0 ]; then echo "${pick[$((h % ${#pick[@]}))]}"; return 0; fi
+  for c in $chans; do
+    d=$(( c > $3 ? c - $3 : $3 - c ))
+    if [ "$d" -gt "$best" ]; then best=$d; pick=("$c"); elif [ "$d" -eq "$best" ]; then pick+=("$c"); fi
+  done
+  [ ${#pick[@]} -gt 0 ] && echo "${pick[$((h % ${#pick[@]}))]}"
+  return 0
+}
+# Channel number to MHz (2.4 and 5 GHz).
+chan_mhz() { if [ "$1" -le 14 ]; then echo $((2407 + 5 * $1)); else echo $((5000 + 5 * $1)); fi; }
 
 # Install whiptail when missing.
 ensure_whiptail() {
@@ -189,6 +246,10 @@ set_defaults() {
   cfg_del course; cfg_del gateway_ssids; cfg_del mesh_psk; cfg_del mesh_prefix
   [ "$(cfg_get mesh_id)" = watiam-mesh ] && cfg_set mesh_id ""
   [ "$(cfg_get ap_psk)" = watiam-mesh ]  && cfg_set ap_psk ""
+  # 20261104: the defaults <group>.mesh and <group>-mesh became <group>-pis and
+  # <group>-ap; a stored old default follows the new one, like on every other node
+  [ "$(cfg_get mesh_id)" = "$(group_name).mesh" ] && cfg_set mesh_id ""
+  [ "$(cfg_get ap_ssid)" = "$(group_name)-mesh" ] && cfg_set ap_ssid ""
   [ "$(cfg_get uplink)" = eduroam ]      && cfg_set uplink external
   cfg_default group      group
   cfg_default mesh_if    auto
@@ -418,6 +479,9 @@ external_dev() {
     | grep -vx -e br0 -e bat0 -e lo -e "${mif:-none}" | head -1
 }
 EOF
+  # the uplink radio checks, shared with the menu (defined near the top of mesh-config.sh)
+  { echo; echo "# Uplink radio capabilities (copied from mesh-config.sh)"
+    declare -f radio_can_ap radio_ap_channels auto_ap_channel; } >> /usr/local/lib/mesh/common.sh
 
   # --- NetworkManager dispatcher: mesh off, dnsmasq forwards to NetworkManager's
   #     DNS servers; mesh on, every network change re-runs the gateway check.
@@ -501,11 +565,14 @@ driver=nl80211
 ssid=@AP_SSID@
 country_code=CA
 ieee80211d=1
-hw_mode=a
-# fixed per node (esp-hosted has no automatic channel selection); non-DFS 5 GHz only
+# a (5 GHz) or g (2.4 GHz), as the radio allows; mesh-uplink.sh picks it with the channel
+hw_mode=@AP_HW_MODE@
+# fixed per node (esp-hosted has no automatic channel selection): non-DFS 5 GHz
+# 36/40/44/48, or 2.4 GHz 1/6/11 away from the mesh channel
 channel=@AP_CHANNEL@
 ieee80211n=1
-ieee80211ac=1
+# 802.11ac exists on 5 GHz only
+ieee80211ac=@AP_AC@
 wmm_enabled=1
 # open (no encryption) until encryption is decided
 EOF
@@ -635,12 +702,12 @@ trap 'rc=$?; echo "mesh-up: FAILED (exit $rc) at line $LINENO: $BASH_COMMAND" >&
 [ -f "$CONF" ] || fail "$CONF not found"
 load_conf
 ID=${id:-}; [ -n "$ID" ] || fail "id not set in $CONF"
-# same rules as 1 Identity: id a DNS label with a letter, group short enough for <group>-mesh (SSID)
+# same rules as 1 Identity: id a DNS label with a letter, group short enough for <group>-pis (SSID)
 [[ $ID =~ ^[a-z0-9]+$ ]] && [[ $ID =~ [a-z] ]] && [ ${#ID} -le 63 ] || fail "invalid id '$ID'"
 [[ $GROUP =~ ^[a-z0-9]+$ ]] && [ ${#GROUP} -le 27 ]                 || fail "invalid group '$GROUP'"
 [ "$ID" != "$GROUP" ]                                               || fail "id and group must differ ('$ID')"
 UPLINK=${uplink:-ap}
-MESH_ID=${mesh_id:-$GROUP.mesh}
+MESH_ID=${mesh_id:-$GROUP-pis}
 case "${mesh_channel:-6}" in 1) FREQ=2412;; 11) FREQ=2462;; *) FREQ=2437;; esac
 # cell id derived from the mesh name (locally administered MAC)
 BSSID=02:$(printf %s "$MESH_ID" | md5sum | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*/\1:\2:\3:\4:\5/')
@@ -961,14 +1028,31 @@ case "$UPLINK" in
     logger -t mesh-uplink "$IF: external, connection $PROFILE"
     ;;
   ap)
-    AP_SSID=${ap_ssid:-$GROUP-mesh}
-    AP_CHANNEL=${ap_channel:-auto}
-    if [ "$AP_CHANNEL" = auto ]; then
-      # one of the non-DFS 5 GHz channels, by node id
-      AP_CHANNEL=$((36 + 4 * (0x$(printf %s "${id:-}" | md5sum | cut -c1-2) % 4)))
+    AP_SSID=${ap_ssid:-$GROUP-ap}
+    # Check the radio before taking it from NetworkManager: a hostapd that cannot start
+    # would leave it idle. A refused role exits 0, so the periodic check does not retry
+    # it (and repeat the warning) every two minutes; the radio stays with NetworkManager.
+    if ! radio_can_ap "$IF"; then
+      rm -f "$RUN/uplink"
+      warn "$IF cannot run an access point (no AP mode); uplink role not applied"
+      exit 0
     fi
+    AP_CHANNEL=${ap_channel:-auto}
+    USABLE=$(radio_ap_channels "$IF" | tr '\n' ' '); USABLE=${USABLE% }
+    if [ "$AP_CHANNEL" = auto ]; then
+      AP_CHANNEL=$(auto_ap_channel "$IF" "${id:-}" "${mesh_channel:-6}")
+    elif [[ " $USABLE " != *" $AP_CHANNEL "* ]]; then
+      AP_CHANNEL=""
+    fi
+    if [ -z "$AP_CHANNEL" ]; then
+      rm -f "$RUN/uplink"
+      warn "$IF cannot run an access point on channel ${ap_channel:-auto} (usable: ${USABLE:-none}); uplink role not applied"
+      exit 0
+    fi
+    if [ "$AP_CHANNEL" -ge 36 ]; then HW_MODE=a; AC=1; else HW_MODE=g; AC=0; fi
     nmcli device set "$IF" managed no >/dev/null 2>&1 || true
-    render "$TPL/hostapd.conf.tpl" /etc/hostapd/hostapd.conf UPLINK_IF="$IF" AP_SSID="$AP_SSID" AP_CHANNEL="$AP_CHANNEL"
+    render "$TPL/hostapd.conf.tpl" /etc/hostapd/hostapd.conf UPLINK_IF="$IF" AP_SSID="$AP_SSID" \
+      AP_CHANNEL="$AP_CHANNEL" AP_HW_MODE="$HW_MODE" AP_AC="$AC"
     systemctl start hostapd \
       || { warn "hostapd failed to start on $IF ('$AP_SSID', channel $AP_CHANNEL)"; exit 1; }
     logger -t mesh-uplink "$IF: ap '$AP_SSID' channel $AP_CHANNEL"
@@ -1336,7 +1420,7 @@ apply_usb_gadget() {
 # ------------------------------------------------------------------ menus ----
 
 # 1 Identity: group, node ID, display name, Linux user. Group and ID take
-# lowercase letters and digits only (group at most 27 characters, so <group>-mesh
+# lowercase letters and digits only (group at most 27 characters, so <group>-pis
 # fits an SSID; ID at most 63 with at least one letter, a hostname that useradd
 # takes) and must differ; anything else is asked again.
 menu_identity() {
@@ -1468,16 +1552,26 @@ choose_nm_profile() {
       "${items[@]}" 3>&1 1>&2 2>&3
 }
 
-# 3 Uplink: uplink interface and role (external network, access point, off).
+# 3 Uplink: uplink interface and role (external network, access point, off). When the
+# radio is attached, the access point role and its channels follow what it can do;
+# mesh-uplink.sh checks again when the role starts (the radio may change in between).
 menu_uplink() {
-  local ifname role profile ssid chan cur_ssid
+  local ifname rif role profile ssid chan cur_ssid cur_ch mc chans c auto_ch auto_desc can_ap=unknown
+  local -a roles=() items=()
   ifname=$(ask "Enter the uplink interface (auto or a name). Present: $(wifi_ifaces)" "$(cfg_get uplink_if)") || return
   [[ $ifname =~ ^(auto|[A-Za-z0-9_.-]{1,15})$ ]] || { msg "Invalid interface name"; return; }
-  role=$(whiptail --title "$TITLE" --radiolist "Select the uplink role" 14 60 3 \
-      "external" "External network via NetworkManager (gateway)" "$([ "$(cfg_get uplink)" = external ] && echo ON || echo OFF)" \
-      "ap"       "Access point"                                  "$([ "$(cfg_get uplink)" = ap ] && echo ON || echo OFF)" \
-      "off"      "Unused"                                        "$([ "$(cfg_get uplink)" = off ] && echo ON || echo OFF)" \
-      3>&1 1>&2 2>&3) || return
+  # the radio this setting points at, when attached ("auto": the first one that is not built in)
+  if [ "$ifname" = auto ]; then rif=$(uplink_candidates | head -n1); else rif=$ifname; fi
+  if [ -n "$rif" ] && [ -e "/sys/class/net/$rif/phy80211" ] && command -v iw >/dev/null 2>&1; then
+    if radio_can_ap "$rif"; then can_ap=yes; else can_ap=no; fi
+  else
+    rif=""
+  fi
+  roles=("external" "External network via NetworkManager (gateway)" "$([ "$(cfg_get uplink)" = external ] && echo ON || echo OFF)")
+  [ "$can_ap" = no ] || roles+=("ap" "Access point" "$([ "$(cfg_get uplink)" = ap ] && echo ON || echo OFF)")
+  roles+=("off" "Unused" "$([ "$(cfg_get uplink)" = off ] && echo ON || echo OFF)")
+  [ "$can_ap" = no ] && msg "$rif cannot run an access point (no AP mode). Choose an external network or off"
+  role=$(whiptail --title "$TITLE" --radiolist "Select the uplink role" 14 60 3 "${roles[@]}" 3>&1 1>&2 2>&3) || return
   # mesh.conf is written only once all answers are in
   case $role in
     external)
@@ -1489,15 +1583,24 @@ menu_uplink() {
       cur_ssid=$(ap_ssid_name)
       ssid=$(ask "Enter the access point SSID (same on all nodes)" "$cur_ssid") || return
       [ -n "$ssid" ] && [ ${#ssid} -le 32 ] && [[ $ssid != *\"* ]] || { msg "SSID must be 1 to 32 characters without double quotes"; return; }
-      chan=$(whiptail --title "$TITLE" --radiolist "Select the access point channel" 14 60 5 \
-          "auto" "36/40/44/48 by node ID" "$([ "$(cfg_get ap_channel)" = auto ] && echo ON || echo OFF)" \
-          "36"   "5180 MHz" "$([ "$(cfg_get ap_channel)" = 36 ] && echo ON || echo OFF)" \
-          "40"   "5200 MHz" "$([ "$(cfg_get ap_channel)" = 40 ] && echo ON || echo OFF)" \
-          "44"   "5220 MHz" "$([ "$(cfg_get ap_channel)" = 44 ] && echo ON || echo OFF)" \
-          "48"   "5240 MHz" "$([ "$(cfg_get ap_channel)" = 48 ] && echo ON || echo OFF)" \
-          3>&1 1>&2 2>&3) || return
+      cur_ch=$(cfg_get ap_channel); mc=$(cfg_get mesh_channel); mc=${mc:-6}
+      if [ -n "$rif" ]; then
+        chans=$(radio_ap_channels "$rif")
+        [ -n "$chans" ] || { msg "$rif has no usable access point channel (1/6/11, 36/40/44/48). Check the Wi-Fi country (raspi-config)"; return; }
+        auto_ch=$(auto_ap_channel "$rif" "$(cfg_get id)" "$mc")
+        if [ "$auto_ch" -ge 36 ]; then auto_desc="5 GHz by node ID ($rif: $auto_ch)"
+        else auto_desc="2.4 GHz away from the mesh ($rif: $auto_ch)"; fi
+      else
+        chans="1 6 11 36 40 44 48"
+        auto_desc="5 GHz if the radio can, else 2.4 GHz"
+      fi
+      items=("auto" "$auto_desc" "$([ "$cur_ch" = auto ] && echo ON || echo OFF)")
+      for c in $chans; do
+        items+=("$c" "$(chan_mhz "$c") MHz$([ "$c" = "$mc" ] && echo ", the mesh channel")" "$([ "$cur_ch" = "$c" ] && echo ON || echo OFF)")
+      done
+      chan=$(whiptail --title "$TITLE" --radiolist "Select the access point channel${rif:+ ($rif)}" 18 66 8 "${items[@]}" 3>&1 1>&2 2>&3) || return
       cfg_set uplink_if "$ifname"; cfg_set uplink ap; cfg_set ap_channel "$chan"
-      cfg_set_or_follow ap_ssid "$ssid" "$(group_name)-mesh"
+      cfg_set_or_follow ap_ssid "$ssid" "$(default_ap_ssid)"
       msg "Uplink: open access point '$ssid', channel $chan"
       ;;
     off) cfg_set uplink_if "$ifname"; cfg_set uplink off ;;
@@ -1523,7 +1626,7 @@ menu_radio() {
       "11" "2462 MHz" "$([ "$(cfg_get mesh_channel)" = 11 ] && echo ON || echo OFF)" \
       3>&1 1>&2 2>&3) || return
   cfg_set mesh_if "$mif"; cfg_set mesh_channel "$ch"
-  cfg_set_or_follow mesh_id "$mid" "$(group_name).mesh"
+  cfg_set_or_follow mesh_id "$mid" "$(default_mesh_name)"
   msg "Mesh radio settings saved. The ad-hoc network is open (no encryption)"
   mesh_active && yesno "Restart the mesh now?" && { clear; run_checked systemctl restart mesh.service && report_mesh_state; }
   return 0
@@ -1586,7 +1689,7 @@ menu_wifi() {
 
 # 8 Status.
 show_status() {
-  local f mif uif gw; f=$(mktemp)
+  local f mif uif gw r ch; f=$(mktemp)
   mif=$(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null); uif=$(cat /run/mesh/uplink 2>/dev/null); gw=$(cat /run/mesh/gateway 2>/dev/null)
   {
     echo "mesh-config version: $(installed_version)"
@@ -1597,6 +1700,10 @@ show_status() {
     echo; echo "Wi-Fi interfaces: $(wifi_ifaces)"
     echo "Mesh radio: ${mif:-none}  $(iw dev "${mif:-none}" link 2>/dev/null | head -1)"
     echo "Uplink radio: ${uif:-none} (uplink_if=$(cfg_get uplink_if) role=$(cfg_get uplink) profile=$(cfg_get uplink_profile)) mesh-uplink@${uif:-?}: $(systemctl is-active "mesh-uplink@${uif:-none}" 2>/dev/null)"
+    for r in $(uplink_candidates); do
+      ch=$(radio_ap_channels "$r" | tr '\n' ' '); ch=${ch% }
+      echo "  $r: access point $(radio_can_ap "$r" && echo yes || echo no), AP channels: ${ch:-none}"
+    done
     [ "$(systemctl is-active hostapd 2>/dev/null)" = active ] && echo "Access point: '$(sed -n 's/^ssid=//p' /etc/hostapd/hostapd.conf 2>/dev/null)' channel $(sed -n 's/^channel=//p' /etc/hostapd/hostapd.conf 2>/dev/null), clients: $(iw dev "${uif:-none}" station dump 2>/dev/null | grep -c '^Station') of 8"
     echo "eth0: bridged=$(cfg_get bridge_eth0) dhcp=$(cfg_get eth0_dhcp)$(nft list table bridge meshdhcp >/dev/null 2>&1 && echo ' (DHCP blocked at eth0)')"
     if [ -n "$gw" ]; then echo "Gateway: on via $gw ($(nmcli -g GENERAL.CONNECTION device show "$gw" 2>/dev/null))"; else echo "Gateway: off"; fi
