@@ -143,6 +143,7 @@ mode. If you reconfigure the radio before that, the ad-hoc join in step 5 fails 
 ## 5. Join the ad-hoc cell
 
 ```bash
+sudo iw dev wlan0 set power_save off              # first, while wlan0 is still in managed mode
 sudo ip link set wlan0 down
 sudo iw dev wlan0 set type ibss
 sudo ip link set wlan0 mtu 1532 || true          # refused on Pi radios, see step 2
@@ -155,6 +156,13 @@ sleep 5; iw dev wlan0 link                        # "Joined IBSS 02:27:79:d9:13:
 2437 MHz is channel 6 (1 is 2412, 11 is 2462). Name, channel and cell ID must be
 identical on every Pi. The join returns at once; the radio scans for an existing cell
 with that name and joins it, or creates it if none is found.
+
+Power save must be off. NetworkManager turns it on for many Pis, and the radio keeps the
+setting when it is handed over. With power save on, `iw dev wlan0 link` still says "Joined
+IBSS", but the radio sends no beacons: no other Pi or laptop sees the cell, nobody merges
+with it, and `batctl o` stays empty. The kernel accepts the setting only in managed mode,
+which is why it comes before the type change. Check it with `iw dev wlan0 get power_save`;
+from a laptop, `nmcli device wifi list` shows the cell as `Ad-Hoc` once it beacons.
 
 ## 6. batman-adv and the bridge
 
@@ -527,7 +535,8 @@ partition holding all choices.
 - `ibss join` says `Operation not supported (-95)`: the interface was not in IBSS type at that instant. Check `iw dev wlan0 info`; wpa_supplicant probably reset it (step 4).
 - `mtu greater than device maximum`: expected on Pi radios; ignore.
 - dnsmasq refuses to start: never put template files in `/etc/dnsmasq.d`, it reads every file there. `journalctl -t dnsmasq` names the bad line.
-- `batctl o` stays empty: compare `iw dev wlan0 link` on both Pis (same name, channel, cell). brcmfmac sometimes ignores the fixed cell ID; cells with the same name usually still merge after a few seconds.
+- `batctl o` stays empty and a laptop's Wi-Fi scan shows no `Ad-Hoc` cell from one of the Pis: power save is on for that Pi's radio (`iw dev wlan0 get power_save`); turn it off before the type change (step 5).
+- `batctl o` stays empty: compare `iw dev wlan0 link` on both Pis (same name, channel, cell). brcmfmac sometimes ignores the fixed cell ID (on a Pi Zero 2 W it picked a random one every time); cells with the same name usually still merge after a few seconds.
 - Names do not resolve: `avahi-browse -trp _groupmesh._tcp` must list the other Pi; avahi only listens on `br0` while the mesh is on; the hostname must equal the ID.
 - No DNS after tearing down: `/etc/resolv.conf` points at dnsmasq; either refill `/run/dnsmasq/upstream.conf` as in step 10 or put NetworkManager's `nameserver` lines back.
 
@@ -539,5 +548,6 @@ Messages from `mesh-config.sh`:
 | `caddy.service does not read /etc/caddy/Caddyfile` | Caddy was installed without `apt`, so it has no service, or its service reads a different config file. | Set Caddy up as a service with Caddy's [Manual Installation](https://caddyserver.com/docs/running#manual-installation) guide, with `--config /etc/caddy/Caddyfile` in `ExecStart`. Run `sudo systemctl daemon-reload`, then run `./mesh-config.sh install` again. |
 | `/etc/caddy does not exist` | Caddy was installed without `apt`, and the folder for its config file was never created. | Run `sudo mkdir /etc/caddy`, then run `./mesh-config.sh install` again. |
 | `ID <id> is already used by another node on the mesh` | Another Pi on the mesh already uses this ID. | Choose a different ID in the menu (Identity), then restart the mesh. |
+| `power save is still on for <if>: other nodes may not find this one` | The mesh radio refused to turn power save off, so it may join its ad-hoc cell without sending beacons. | Check `iw dev <if> get power_save`; turn it off by hand (`iw dev <if> set power_save off` while the radio is in managed mode) and restart the mesh. |
 | `<if> cannot run an access point (no AP mode); uplink role not applied` | The second radio does not support access point mode, for example an esp-hosted driver built without AP support. The radio stays with NetworkManager. | Rebuild the esp-hosted driver with `CONFIG_AP_SUPPORT=y`, use another radio, or choose an external network or off (3 Uplink). |
 | `<if> cannot run an access point on channel <n> (usable: ...); uplink role not applied` | The fixed `ap_channel` is one the radio does not have (for example 5 GHz on a 2.4 GHz-only dongle) or may not transmit on in this Wi-Fi country; `usable: none` means no channel at all. | Choose `auto` or a listed channel (3 Uplink); check the Wi-Fi country (`raspi-config`, Localisation). |

@@ -1,5 +1,20 @@
 # Changelog
 
+## 20261104+02
+
+### Fixed
+- Zero peers when a Pi's NetworkManager had left power save on (seen on a Pi Zero 2 W):
+  the mesh radio joined its ad-hoc cell ("Joined IBSS") but sent no beacons, so other Pis
+  never found or merged with it. `mesh-up` turns power save off on the mesh radio before
+  the ad-hoc join (the kernel takes it only in managed mode) and warns
+  `power save is still on for <if>: other nodes may not find this one` if it stays on.
+  NetworkManager applies its own setting again when the mesh stops.
+
+### Added
+- Status (8) shows the mesh radio's power save.
+- Tutorial: the power save step in step 5 and why; troubleshooting for a cell nobody sees,
+  and the new warning in the message table.
+
 ## 20261104+01
 
 Update every Pi of a group together (`sudo mesh-config update`, then restart the mesh): the

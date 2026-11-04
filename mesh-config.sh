@@ -762,6 +762,13 @@ for _ in $(seq 30); do
 done
 [ -e "/run/wpa_supplicant/$MESH_IF" ] && warn "wpa_supplicant still holds $MESH_IF"
 sleep 1
+# Power save off. With it on (NetworkManager turns it on for many Pis), the radio joins
+# its ad-hoc cell but sends no beacons, so other nodes never find or merge with it: zero
+# peers. The kernel takes the setting in managed mode only, so set it before the type
+# change; NetworkManager applies its own setting again when it gets the radio back.
+iw dev "$MESH_IF" set power_save off 2>/dev/null || true
+iw dev "$MESH_IF" get power_save 2>/dev/null | grep -q ': on' \
+  && warn "power save is still on for $MESH_IF: other nodes may not find this one"
 
 # 4. Ad-hoc cell, batman-adv, bridge
 for attempt in 1 2 3; do
@@ -1698,7 +1705,7 @@ show_status() {
     echo; echo "mesh.service: $(systemctl is-active mesh.service) (boot: $(systemctl is-enabled mesh.service 2>/dev/null))"
     echo "dnsmasq: $(systemctl is-active dnsmasq)  avahi: $(systemctl is-active avahi-daemon)  caddy: $(systemctl is-active caddy 2>/dev/null)  hostapd: $(systemctl is-active hostapd)"
     echo; echo "Wi-Fi interfaces: $(wifi_ifaces)"
-    echo "Mesh radio: ${mif:-none}  $(iw dev "${mif:-none}" link 2>/dev/null | head -1)"
+    echo "Mesh radio: ${mif:-none}  $(iw dev "${mif:-none}" link 2>/dev/null | head -1)  power save: $(ps=$(iw dev "${mif:-none}" get power_save 2>/dev/null | sed -n 's/^Power save: //p'); echo "${ps:-unknown}")"
     echo "Uplink radio: ${uif:-none} (uplink_if=$(cfg_get uplink_if) role=$(cfg_get uplink) profile=$(cfg_get uplink_profile)) mesh-uplink@${uif:-?}: $(systemctl is-active "mesh-uplink@${uif:-none}" 2>/dev/null)"
     for r in $(uplink_candidates); do
       ch=$(radio_ap_channels "$r" | tr '\n' ' '); ch=${ch% }
