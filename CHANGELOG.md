@@ -1,5 +1,32 @@
 # Changelog
 
+## 20261122+03
+
+Group words and the Wi-Fi password. Update every Pi of a group together and give them the
+same group words: a Pi with words runs its access point with WPA2, a Pi without runs it
+open under the same name. Tested on a laptop only; not yet run on a Pi.
+
+### Added
+- Group words: five words the whole group shares, four drawn at random from the BIP39
+  English list (2,048 words) and a fifth that is a checksum of them. Stored as `group_words`
+  in `mesh.conf`.
+- 1 Identity asks for them after the group name. **Generate** draws new words on the first
+  Pi of a group and shows them to be read out. **Enter** takes the words on every other Pi:
+  the Pi's current words are filled in, capitals do not matter, a word that is not on the
+  list is named (`Word 3 (...) is not on the list`), and a set whose checksum does not fit
+  gives `These five words do not belong together`. The box comes back until they are right.
+- Wi-Fi password: every Pi works it out of the group words: three list words and four
+  digits, lowercase with no spaces, for example `wheredestroyrookie7499`. All access points
+  of a group so take the same password without anyone typing it on a second Pi.
+- The access point uses WPA2 with that password when the Pi has group words; without words
+  it stays open as before. Words in `mesh.conf` that are not valid refuse the access point
+  role with a warning, so it never comes up open by mistake.
+- Status (8) and 3 Uplink show the Wi-Fi password. After new words on a Pi whose access
+  point is running, 1 Identity offers to apply the new password at once.
+
+### Changed
+- `/etc/hostapd/hostapd.conf` is readable by root only: it holds the Wi-Fi password.
+
 ## 20261122+02
 
 The index page. Built and tested on a laptop with generated data and one real two-Pi

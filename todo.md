@@ -18,9 +18,12 @@ an iPhone. Full page (5.2 MB) loaded in ~13 s.
     re-registered device.
   - Consider adding `interface-name:<uplink_if>` to `unmanaged-devices` in
     99-mesh.conf while uplink=ap (keeps it unmanaged across firmware restarts).
-- [ ] **Encryption (later)**: the access point is open, on purpose, until the network
-      and encryption design is decided. Do not ask about a password before then.
-      Leftover: `ap_psk` in mesh.conf is unused.
+- [ ] **Encryption**: the access point uses WPA2 once the Pi has group words
+      (20261122+03); not yet checked on real Pis. Leftover: `ap_psk` in mesh.conf is
+      unused.
+  - Group words (decided 2026-11-22): five BIP39 words, the fifth a checksum, set in
+    1 Identity (Generate or Enter). The Wi-Fi password is worked out of them: three
+    words and four digits.
   - Mesh radio (Pi to Pi): encryption is left out. We believe it is not currently
     required in a classroom setting (decided 2026-11-22).
   - Gateway spoofing: a node can announce another node's gateway MAC (`mac=` in

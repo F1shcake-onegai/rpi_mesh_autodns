@@ -35,7 +35,11 @@
 #   mesh_channel   2.4 GHz channel 1, 6 or 11
 #   uplink_if      uplink radio: auto (first non-brcmfmac Wi-Fi interface) or a name
 #   uplink         external | ap | off               uplink_profile  NetworkManager profile name or auto
-#   ap_ssid        access point name (default <group>-ap); the access point is open for now
+#   ap_ssid        access point name (default <group>-ap). WPA2 with the group's Wi-Fi password
+#                  when group_words is set, else open
+#   group_words    five words the whole group shares (1 Identity): four BIP39 words drawn at
+#                  random and a checksum word. Every Pi works the group's Wi-Fi password out of
+#                  them: three list words and four digits
 #   ap_channel     auto or a fixed channel. auto: 36/40/44/48 picked from the id when the
 #                  radio can use them, else the 2.4 GHz channel (1/6/11) farthest from
 #                  mesh_channel (1 or 11 picked from the id when the mesh is on 6)
@@ -50,7 +54,8 @@
 # (IP name MAC, from the avahi record), else by the MAC formula.
 #
 # Files written by install (6 Install):
-#   /usr/local/sbin/mesh-{up,down,uplink,role,hosts,map}.sh and /usr/local/lib/mesh/{common.sh,version.txt}
+#   /usr/local/sbin/mesh-{up,down,uplink,role,hosts,map}.sh and
+#     /usr/local/lib/mesh/{common.sh,version.txt,bip39.txt}
 #   /etc/systemd/system/mesh.service, mesh-uplink@.service, mesh-role-check.{service,timer},
 #     mesh-hosts.{service,timer}, mesh-restore.service, mesh-alfred.service, mesh-vis.service,
 #     mesh-map.service, caddy.service.d/mesh.conf
@@ -77,6 +82,7 @@ SELF=$(readlink -f "$0")          # this script: run again under sudo, copied by
 TITLE="Raspberry Pi Mesh Configuration Tool (mesh-config)"
 WARN_FILE=/run/mesh/warnings      # warnings from the mesh scripts
 INTERACTIVE=0                     # 1 inside the menu
+NEW_WORDS=""                      # result of choose_group_words
 # Installed version, and where update downloads version.txt and mesh-config.sh from
 # (MESH_UPDATE_URL overrides it).
 VERSION_FILE=/usr/local/lib/mesh/version.txt
@@ -142,6 +148,182 @@ default_mesh_name() { echo "$(group_name)-pis"; }
 default_ap_ssid()   { echo "$(group_name)-ap"; }
 mesh_name()         { local v; v=$(cfg_get mesh_id); echo "${v:-$(default_mesh_name)}"; }
 ap_ssid_name()      { local v; v=$(cfg_get ap_ssid); echo "${v:-$(default_ap_ssid)}"; }
+
+# Group words and Wi-Fi password. A group shares five words of the BIP39 list: four drawn
+# at random and a fifth that is a checksum of them, so a wrong word is noticed when it is
+# typed. Every Pi works the group's Wi-Fi password out of the words, so all access points of
+# a group take the same one without anyone typing it twice. The first four functions are
+# also used by mesh-uplink.sh (install copies them into common.sh, where bip39_list reads a file).
+
+# The BIP39 English word list, one word per line: 2,048 common words of 3 to 8 letters, no
+# two starting with the same four letters.
+bip39_list() {
+  tr ' ' '\n' <<'EOF'
+abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid
+acoustic acquire across act action actor actress actual adapt add addict address adjust admit adult advance
+advice aerobic affair afford afraid again age agent agree ahead aim air airport aisle alarm album
+alcohol alert alien all alley allow almost alone alpha already also alter always amateur amazing among
+amount amused analyst anchor ancient anger angle angry animal ankle announce annual another answer antenna antique
+anxiety any apart apology appear apple approve april arch arctic area arena argue arm armed armor
+army around arrange arrest arrive arrow art artefact artist artwork ask aspect assault asset assist assume
+asthma athlete atom attack attend attitude attract auction audit august aunt author auto autumn average avocado
+avoid awake aware away awesome awful awkward axis baby bachelor bacon badge bag balance balcony ball
+bamboo banana banner bar barely bargain barrel base basic basket battle beach bean beauty because become
+beef before begin behave behind believe below belt bench benefit best betray better between beyond bicycle
+bid bike bind biology bird birth bitter black blade blame blanket blast bleak bless blind blood
+blossom blouse blue blur blush board boat body boil bomb bone bonus book boost border boring
+borrow boss bottom bounce box boy bracket brain brand brass brave bread breeze brick bridge brief
+bright bring brisk broccoli broken bronze broom brother brown brush bubble buddy budget buffalo build bulb
+bulk bullet bundle bunker burden burger burst bus business busy butter buyer buzz cabbage cabin cable
+cactus cage cake call calm camera camp can canal cancel candy cannon canoe canvas canyon capable
+capital captain car carbon card cargo carpet carry cart case cash casino castle casual cat catalog
+catch category cattle caught cause caution cave ceiling celery cement census century cereal certain chair chalk
+champion change chaos chapter charge chase chat cheap check cheese chef cherry chest chicken chief child
+chimney choice choose chronic chuckle chunk churn cigar cinnamon circle citizen city civil claim clap clarify
+claw clay clean clerk clever click client cliff climb clinic clip clock clog close cloth cloud
+clown club clump cluster clutch coach coast coconut code coffee coil coin collect color column combine
+come comfort comic common company concert conduct confirm congress connect consider control convince cook cool copper
+copy coral core corn correct cost cotton couch country couple course cousin cover coyote crack cradle
+craft cram crane crash crater crawl crazy cream credit creek crew cricket crime crisp critic crop
+cross crouch crowd crucial cruel cruise crumble crunch crush cry crystal cube culture cup cupboard curious
+current curtain curve cushion custom cute cycle dad damage damp dance danger daring dash daughter dawn
+day deal debate debris decade december decide decline decorate decrease deer defense define defy degree delay
+deliver demand demise denial dentist deny depart depend deposit depth deputy derive describe desert design desk
+despair destroy detail detect develop device devote diagram dial diamond diary dice diesel diet differ digital
+dignity dilemma dinner dinosaur direct dirt disagree discover disease dish dismiss disorder display distance divert divide
+divorce dizzy doctor document dog doll dolphin domain donate donkey donor door dose double dove draft
+dragon drama drastic draw dream dress drift drill drink drip drive drop drum dry duck dumb
+dune during dust dutch duty dwarf dynamic eager eagle early earn earth easily east easy echo
+ecology economy edge edit educate effort egg eight either elbow elder electric elegant element elephant elevator
+elite else embark embody embrace emerge emotion employ empower empty enable enact end endless endorse enemy
+energy enforce engage engine enhance enjoy enlist enough enrich enroll ensure enter entire entry envelope episode
+equal equip era erase erode erosion error erupt escape essay essence estate eternal ethics evidence evil
+evoke evolve exact example excess exchange excite exclude excuse execute exercise exhaust exhibit exile exist exit
+exotic expand expect expire explain expose express extend extra eye eyebrow fabric face faculty fade faint
+faith fall false fame family famous fan fancy fantasy farm fashion fat fatal father fatigue fault
+favorite feature february federal fee feed feel female fence festival fetch fever few fiber fiction field
+figure file film filter final find fine finger finish fire firm first fiscal fish fit fitness
+fix flag flame flash flat flavor flee flight flip float flock floor flower fluid flush fly
+foam focus fog foil fold follow food foot force forest forget fork fortune forum forward fossil
+foster found fox fragile frame frequent fresh friend fringe frog front frost frown frozen fruit fuel
+fun funny furnace fury future gadget gain galaxy gallery game gap garage garbage garden garlic garment
+gas gasp gate gather gauge gaze general genius genre gentle genuine gesture ghost giant gift giggle
+ginger giraffe girl give glad glance glare glass glide glimpse globe gloom glory glove glow glue
+goat goddess gold good goose gorilla gospel gossip govern gown grab grace grain grant grape grass
+gravity great green grid grief grit grocery group grow grunt guard guess guide guilt guitar gun
+gym habit hair half hammer hamster hand happy harbor hard harsh harvest hat have hawk hazard
+head health heart heavy hedgehog height hello helmet help hen hero hidden high hill hint hip
+hire history hobby hockey hold hole holiday hollow home honey hood hope horn horror horse hospital
+host hotel hour hover hub huge human humble humor hundred hungry hunt hurdle hurry hurt husband
+hybrid ice icon idea identify idle ignore ill illegal illness image imitate immense immune impact impose
+improve impulse inch include income increase index indicate indoor industry infant inflict inform inhale inherit initial
+inject injury inmate inner innocent input inquiry insane insect inside inspire install intact interest into invest
+invite involve iron island isolate issue item ivory jacket jaguar jar jazz jealous jeans jelly jewel
+job join joke journey joy judge juice jump jungle junior junk just kangaroo keen keep ketchup
+key kick kid kidney kind kingdom kiss kit kitchen kite kitten kiwi knee knife knock know
+lab label labor ladder lady lake lamp language laptop large later latin laugh laundry lava law
+lawn lawsuit layer lazy leader leaf learn leave lecture left leg legal legend leisure lemon lend
+length lens leopard lesson letter level liar liberty library license life lift light like limb limit
+link lion liquid list little live lizard load loan lobster local lock logic lonely long loop
+lottery loud lounge love loyal lucky luggage lumber lunar lunch luxury lyrics machine mad magic magnet
+maid mail main major make mammal man manage mandate mango mansion manual maple marble march margin
+marine market marriage mask mass master match material math matrix matter maximum maze meadow mean measure
+meat mechanic medal media melody melt member memory mention menu mercy merge merit merry mesh message
+metal method middle midnight milk million mimic mind minimum minor minute miracle mirror misery miss mistake
+mix mixed mixture mobile model modify mom moment monitor monkey monster month moon moral more morning
+mosquito mother motion motor mountain mouse move movie much muffin mule multiply muscle museum mushroom music
+must mutual myself mystery myth naive name napkin narrow nasty nation nature near neck need negative
+neglect neither nephew nerve nest net network neutral never news next nice night noble noise nominee
+noodle normal north nose notable note nothing notice novel now nuclear number nurse nut oak obey
+object oblige obscure observe obtain obvious occur ocean october odor off offer office often oil okay
+old olive olympic omit once one onion online only open opera opinion oppose option orange orbit
+orchard order ordinary organ orient original orphan ostrich other outdoor outer output outside oval oven over
+own owner oxygen oyster ozone pact paddle page pair palace palm panda panel panic panther paper
+parade parent park parrot party pass patch path patient patrol pattern pause pave payment peace peanut
+pear peasant pelican pen penalty pencil people pepper perfect permit person pet phone photo phrase physical
+piano picnic picture piece pig pigeon pill pilot pink pioneer pipe pistol pitch pizza place planet
+plastic plate play please pledge pluck plug plunge poem poet point polar pole police pond pony
+pool popular portion position possible post potato pottery poverty powder power practice praise predict prefer prepare
+present pretty prevent price pride primary print priority prison private prize problem process produce profit program
+project promote proof property prosper protect proud provide public pudding pull pulp pulse pumpkin punch pupil
+puppy purchase purity purpose purse push put puzzle pyramid quality quantum quarter question quick quit quiz
+quote rabbit raccoon race rack radar radio rail rain raise rally ramp ranch random range rapid
+rare rate rather raven raw razor ready real reason rebel rebuild recall receive recipe record recycle
+reduce reflect reform refuse region regret regular reject relax release relief rely remain remember remind remove
+render renew rent reopen repair repeat replace report require rescue resemble resist resource response result retire
+retreat return reunion reveal review reward rhythm rib ribbon rice rich ride ridge rifle right rigid
+ring riot ripple risk ritual rival river road roast robot robust rocket romance roof rookie room
+rose rotate rough round route royal rubber rude rug rule run runway rural sad saddle sadness
+safe sail salad salmon salon salt salute same sample sand satisfy satoshi sauce sausage save say
+scale scan scare scatter scene scheme school science scissors scorpion scout scrap screen script scrub sea
+search season seat second secret section security seed seek segment select sell seminar senior sense sentence
+series service session settle setup seven shadow shaft shallow share shed shell sheriff shield shift shine
+ship shiver shock shoe shoot shop short shoulder shove shrimp shrug shuffle shy sibling sick side
+siege sight sign silent silk silly silver similar simple since sing siren sister situate six size
+skate sketch ski skill skin skirt skull slab slam sleep slender slice slide slight slim slogan
+slot slow slush small smart smile smoke smooth snack snake snap sniff snow soap soccer social
+sock soda soft solar soldier solid solution solve someone song soon sorry sort soul sound soup
+source south space spare spatial spawn speak special speed spell spend sphere spice spider spike spin
+spirit split spoil sponsor spoon sport spot spray spread spring spy square squeeze squirrel stable stadium
+staff stage stairs stamp stand start state stay steak steel stem step stereo stick still sting
+stock stomach stone stool story stove strategy street strike strong struggle student stuff stumble style subject
+submit subway success such sudden suffer sugar suggest suit summer sun sunny sunset super supply supreme
+sure surface surge surprise surround survey suspect sustain swallow swamp swap swarm swear sweet swift swim
+swing switch sword symbol symptom syrup system table tackle tag tail talent talk tank tape target
+task taste tattoo taxi teach team tell ten tenant tennis tent term test text thank that
+theme then theory there they thing this thought three thrive throw thumb thunder ticket tide tiger
+tilt timber time tiny tip tired tissue title toast tobacco today toddler toe together toilet token
+tomato tomorrow tone tongue tonight tool tooth top topic topple torch tornado tortoise toss total tourist
+toward tower town toy track trade traffic tragic train transfer trap trash travel tray treat tree
+trend trial tribe trick trigger trim trip trophy trouble truck true truly trumpet trust truth try
+tube tuition tumble tuna tunnel turkey turn turtle twelve twenty twice twin twist two type typical
+ugly umbrella unable unaware uncle uncover under undo unfair unfold unhappy uniform unique unit universe unknown
+unlock until unusual unveil update upgrade uphold upon upper upset urban urge usage use used useful
+useless usual utility vacant vacuum vague valid valley valve van vanish vapor various vast vault vehicle
+velvet vendor venture venue verb verify version very vessel veteran viable vibrant vicious victory video view
+village vintage violin virtual virus visa visit visual vital vivid vocal voice void volcano volume vote
+voyage wage wagon wait walk wall walnut want warfare warm warrior wash wasp waste water wave
+way wealth weapon wear weasel weather web wedding weekend weird welcome west wet whale what wheat
+wheel when where whip whisper wide width wife wild will win window wine wing wink winner
+winter wire wisdom wise wish witness wolf woman wonder wood wool word work world worry worth
+wrap wreck wrestle wrist write wrong yard year yellow you young youth zebra zero zone zoo
+EOF
+}
+# Word number $1 (0 to 2047) of the list.
+bip39_word() { bip39_list | sed -n "$(($1 + 1))p"; }
+# Checksum word of the four words in $1 ("w1 w2 w3 w4"): picked by a hash of them.
+words_check() { bip39_word $((0x$(printf '%s' "$1" | sha256sum | cut -c1-3) % 2048)); }
+# What is wrong with the group words in $1 (lowercase, single spaces); nothing when they are right.
+words_error() {
+  local -a w
+  local i
+  read -ra w <<< "$1"
+  [ ${#w[@]} -eq 5 ] || { echo "Enter five words (${#w[@]} given)"; return 0; }
+  for i in 0 1 2 3 4; do
+    bip39_list | grep -qxF -- "${w[i]}" || { echo "Word $((i + 1)) (${w[i]}) is not on the list"; return 0; }
+  done
+  [ "$(words_check "${w[*]:0:4}")" = "${w[4]}" ] || echo "These five words do not belong together"
+  return 0
+}
+# Wi-Fi password for the group words in $1: three list words and four digits, picked by a
+# hash of the words. Lowercase letters and digits only, so it is easy to say and to type.
+# Nothing for no words. A plain hash is enough while the words guard nothing but this password.
+wifi_password() {
+  local h
+  [ -n "$1" ] || return 0
+  h=$(printf 'mesh-config wifi 1:%s' "$1" | sha256sum)
+  printf '%s%s%s%04d\n' "$(bip39_word $((0x${h:0:3} % 2048)))" "$(bip39_word $((0x${h:3:3} % 2048)))" \
+    "$(bip39_word $((0x${h:6:3} % 2048)))" $((0x${h:9:8} % 10000))
+}
+# Group words as typed, tidied: lowercase, single spaces.
+words_clean() { local w; w=$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -s '[:space:]' ' '); w=${w# }; echo "${w% }"; }
+# Five new group words: four at random, the fifth their checksum.
+words_new() {
+  local w="" i
+  for i in 1 2 3 4; do w="$w $(bip39_word $(($(od -An -N2 -tu2 /dev/urandom) % 2048)))"; done
+  w=${w# }
+  echo "$w $(words_check "$w")"
+}
 
 # Uplink radio capabilities. Used by the menu and, copied into common.sh by
 # install (declare -f), by mesh-uplink.sh. They read "iw phy <phy> info".
@@ -514,6 +696,11 @@ EOF
   # the uplink radio checks, shared with the menu (defined near the top of mesh-config.sh)
   { echo; echo "# Uplink radio capabilities (copied from mesh-config.sh)"
     declare -f radio_can_ap radio_ap_channels auto_ap_channel; } >> /usr/local/lib/mesh/common.sh
+  # the group words checks and the Wi-Fi password, with the word list as a file
+  bip39_list > /usr/local/lib/mesh/bip39.txt
+  { echo; echo "# Group words and Wi-Fi password (copied from mesh-config.sh)"
+    echo 'bip39_list() { cat /usr/local/lib/mesh/bip39.txt; }'
+    declare -f bip39_word words_check words_error wifi_password; } >> /usr/local/lib/mesh/common.sh
 
   # --- NetworkManager dispatcher: mesh off, dnsmasq forwards to NetworkManager's
   #     DNS servers; mesh on, every network change re-runs the gateway check.
@@ -611,7 +798,8 @@ ieee80211n=1
 # 802.11ac exists on 5 GHz only
 ieee80211ac=@AP_AC@
 wmm_enabled=1
-# open (no encryption) until encryption is decided
+# WPA2 with the group's Wi-Fi password when the group has words (1 Identity), else open
+@AP_SECURITY@
 EOF
 
   # --- firewall table for gateway nodes (rendered with the uplink interface)
@@ -1476,12 +1664,28 @@ case $UPLINK in
     fi
     # 5 GHz: hw_mode a with 802.11ac; 2.4 GHz: hw_mode g without
     if [ "$AP_CHANNEL" -ge 36 ]; then HW_MODE=a; AC=1; else HW_MODE=g; AC=0; fi
+    # WPA2 with the Wi-Fi password worked out of the group words; open while the group has
+    # none. Words that are not valid refuse the role: an access point must not come up open
+    # when its group expects a password
+    WORDS=${group_words:-}
+    if [ -z "$WORDS" ]; then
+      AP_SECURITY="# open: this group has no group words"; SEC=open
+    else
+      ERR=$(words_error "$WORDS")
+      if [ -n "$ERR" ]; then
+        rm -f "$RUN/uplink"
+        warn "group words in mesh.conf are not valid ($ERR); uplink role not applied"
+        exit 0
+      fi
+      AP_SECURITY=$(printf 'wpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nwpa_passphrase=%s' "$(wifi_password "$WORDS")"); SEC=wpa2
+    fi
     nmcli device set "$IF" managed no >/dev/null 2>&1 || true
     render "$TPL/hostapd.conf.tpl" /etc/hostapd/hostapd.conf UPLINK_IF="$IF" AP_SSID="$AP_SSID" \
-      AP_CHANNEL="$AP_CHANNEL" AP_HW_MODE="$HW_MODE" AP_AC="$AC"
+      AP_CHANNEL="$AP_CHANNEL" AP_HW_MODE="$HW_MODE" AP_AC="$AC" AP_SECURITY="$AP_SECURITY"
+    chmod 600 /etc/hostapd/hostapd.conf   # it holds the Wi-Fi password
     systemctl start hostapd \
       || { warn "hostapd failed to start on $IF ('$AP_SSID', channel $AP_CHANNEL)"; exit 1; }
-    logger -t mesh-uplink "$IF: ap '$AP_SSID' channel $AP_CHANNEL"
+    logger -t mesh-uplink "$IF: ap '$AP_SSID' channel $AP_CHANNEL $SEC"
     ;;
 esac
 exit 0
@@ -1983,14 +2187,43 @@ apply_usb_gadget() {
 
 # ------------------------------------------------------------------ menus ----
 
-# 1 Identity: group, node ID, display name, Linux user. Group and ID take
+# Group words step of 1 Identity. Generate: new words, for the first Pi of a group, shown
+# to be read out. Enter: the words the group already has; the Pi's current words are filled
+# in, so OK keeps them, and a wrong word or a wrong set is named and asked again. The result
+# is left in NEW_WORDS. Returns 1 on Cancel.
+choose_group_words() {
+  local choice words err
+  words=$(cfg_get group_words)
+  while :; do
+    choice=$(whiptail --title "$TITLE" --menu "Group words: five words, the same on every Pi of the group" 12 72 2 \
+        "1 Generate" "New words, for the first Pi of a group" \
+        "2 Enter"    "The words your group already has" \
+        3>&1 1>&2 2>&3) || return 1
+    case ${choice%% *} in
+      1) if [ -n "$words" ]; then yesno "This Pi already has group words. Replace them with new ones?" || continue; fi
+         words=$(words_new)
+         msg "Read these five words to your group. Everyone else chooses Enter and types them:\n\n    $words"
+         break ;;
+      2) while :; do
+           words=$(ask "Enter the five group words (capitals do not matter)" "$words") || return 1
+           words=$(words_clean "$words")
+           err=$(words_error "$words")
+           [ -z "$err" ] && break 2
+           msg "$err"
+         done ;;
+    esac
+  done
+  NEW_WORDS=$words
+}
+
+# 1 Identity: group, group words, node ID, display name, Linux user. Group and ID take
 # lowercase letters and digits only (group at most 27 characters, so <group>-pis
 # fits an SSID; ID at most 63 with at least one letter, a hostname that useradd
 # takes) and must differ. The display name (shown as @name on the index page) takes
 # letters, digits, spaces and . _ - only, at most 24. Anything else is asked again.
 menu_identity() {
-  local id group display rc
-  id=$(cfg_get id); group=$(cfg_get group)
+  local id group display rc words old_words
+  id=$(cfg_get id); group=$(cfg_get group); old_words=$(cfg_get group_words)
   while :; do
     group=$(ask "Enter the group name (same on all nodes)" "$group") || return
     [ -n "$group" ] || group=group
@@ -1998,6 +2231,8 @@ menu_identity() {
     [ ${#group} -le 27 ]        || { msg "Group name must be at most 27 characters"; continue; }
     break
   done
+  choose_group_words || return
+  words=$NEW_WORDS
   while :; do
     id=$(ask "Enter the node ID (lowercase letters and digits)" "$id") || return
     [[ $id =~ ^[a-z0-9]+$ ]] || { msg "Use only lowercase letters and numbers"; continue; }
@@ -2012,7 +2247,7 @@ menu_identity() {
     [[ $display =~ ^[A-Za-z0-9\ ._-]{0,24}$ ]] || { msg "Use only letters, digits, spaces and . _ - (at most 24 characters)"; continue; }
     break
   done
-  cfg_set id "$id"; cfg_set group "$group"; cfg_set display "$display"
+  cfg_set id "$id"; cfg_set group "$group"; cfg_set group_words "$words"; cfg_set display "$display"
   if id -u "$id" >/dev/null 2>&1; then
     msg "User $id exists. Web folder: /home/$id/public"
   elif yesno "Create user $id?"; then
@@ -2030,6 +2265,10 @@ menu_identity() {
     clear; write_system_files; rc=$?
     [ "$rc" -eq 0 ] || echo "Install failed (exit $rc)"
     read -rp "Press Enter to continue"
+  fi
+  # new words mean a new Wi-Fi password: a running access point takes it when its role is applied again
+  if [ "$words" != "$old_words" ] && mesh_active && [ "$(cfg_get uplink)" = ap ]; then
+    yesno "The Wi-Fi password changed with the group words. Apply it to the access point now?" && { clear; apply_uplink_now; }
   fi
 }
 
@@ -2129,7 +2368,7 @@ choose_nm_profile() {
 # radio is attached, the access point role and its channels follow what it can do;
 # mesh-uplink.sh checks again when the role starts (the radio may change in between).
 menu_uplink() {
-  local ifname rif role profile ssid chan cur_ssid cur_ch mc chans c auto_ch auto_desc can_ap=unknown
+  local ifname rif role profile ssid chan cur_ssid cur_ch mc chans c auto_ch auto_desc pw can_ap=unknown
   local -a roles=() items=()
   ifname=$(ask "Enter the uplink interface (auto or a name). Present: $(wifi_ifaces)" "$(cfg_get uplink_if)") || return
   [[ $ifname =~ ^(auto|[A-Za-z0-9_.-]{1,15})$ ]] || { msg "Invalid interface name"; return; }
@@ -2174,7 +2413,9 @@ menu_uplink() {
       chan=$(whiptail --title "$TITLE" --radiolist "Select the access point channel${rif:+ ($rif)}" 18 66 8 "${items[@]}" 3>&1 1>&2 2>&3) || return
       cfg_set uplink_if "$ifname"; cfg_set uplink ap; cfg_set ap_channel "$chan"
       cfg_set_or_follow ap_ssid "$ssid" "$(default_ap_ssid)"
-      msg "Uplink: open access point '$ssid', channel $chan"
+      pw=$(wifi_password "$(cfg_get group_words)")
+      if [ -n "$pw" ]; then msg "Uplink: access point '$ssid', channel $chan, Wi-Fi password $pw"
+      else msg "Uplink: open access point '$ssid', channel $chan (no group words: 1 Identity)"; fi
       ;;
     off) cfg_set uplink_if "$ifname"; cfg_set uplink off ;;
   esac
@@ -2279,13 +2520,17 @@ show_map_data() {
 # 8 Status: settings, services, radios, addresses, routes, peers, warnings and the
 # recent log on one page (also "mesh-config status").
 show_status() {
-  local f mif uif gw r ch; f=$(mktemp)
+  local f mif uif gw r ch words; f=$(mktemp)
   mif=$(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null); uif=$(cat /run/mesh/uplink 2>/dev/null); gw=$(cat /run/mesh/gateway 2>/dev/null)
   {
     echo "mesh-config version: $(installed_version)"
     # mesh.conf as it is, the values of ap_psk and mesh_psk hidden
     echo "mesh.conf: $CONF"; echo "----"; sed 's/^\(ap_psk\|mesh_psk\)=.*/\1=(hidden)/' "$CONF" 2>/dev/null
     echo "Derived: group=$(group_name) mesh=$(mesh_name) ap=$(ap_ssid_name)"
+    words=$(cfg_get group_words)
+    if [ -z "$words" ]; then echo "Wi-Fi password: none, the access point is open (set group words in 1 Identity)"
+    elif [ -n "$(words_error "$words")" ]; then echo "Wi-Fi password: none, the group words are not valid: $(words_error "$words")"
+    else echo "Wi-Fi password: $(wifi_password "$words") (WPA2, from the group words)"; fi
     echo; echo "mesh.service: $(systemctl is-active mesh.service) (boot: $(systemctl is-enabled mesh.service 2>/dev/null))"
     echo "dnsmasq: $(systemctl is-active dnsmasq)  avahi: $(systemctl is-active avahi-daemon)  caddy: $(systemctl is-active caddy 2>/dev/null)  hostapd: $(systemctl is-active hostapd)"
     echo; echo "Wi-Fi interfaces: $(wifi_ifaces)"
@@ -2326,7 +2571,7 @@ main_menu() {
     id=$(cfg_get id)
     mesh_active && state="on" || state="off"
     choice=$(whiptail --title "$TITLE" --menu "Node: ${id:-unset}   Group: $(group_name)   Mesh: $state   Uplink: $(cfg_get uplink)" 20 70 9 \
-      "1 Identity" "Node ID, group, user" \
+      "1 Identity" "Group, group words, node ID, user" \
       "2 Mesh"     "Start, stop, enable at boot" \
       "3 Uplink"   "External network, access point or off" \
       "4 Radio"    "Ad-hoc name, channel" \

@@ -450,6 +450,16 @@ ieee80211ac=1
 wmm_enabled=1
 ```
 
+That access point is open. For a password, add four lines; the script does this when the Pi
+has group words, with the Wi-Fi password it works out of them:
+
+```
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=your-password-of-8-to-63-characters
+```
+
 That is 5 GHz. Prefer it when the radio can: the mesh runs on 2.4 GHz, and a 2.4 GHz access
 point a few centimetres from the mesh radio drowns out its reception even on another
 channel. On a 2.4 GHz-only radio use `hw_mode=g`, `ieee80211ac=0` and the channel farthest
@@ -500,7 +510,8 @@ sudo pkill -HUP -x dnsmasq                          # dnsmasq now forwards to th
 | 9b | `mesh-uplink.sh` from `mesh-uplink@IFACE.service`, started by udev when the radio is plugged in |
 | 10 | `mesh-down.sh`, run as `ExecStopPost` so it also runs when a start failed half way; it also puts the original hostname and avahi settings back, and `mesh-restore.service` runs that part again at every boot (`mesh-down.sh restore`, before avahi and the mesh) in case the mesh was on at a power cut |
 
-Checks a tutorial leaves to you: 1 Identity asks the group first, then the ID, and refuses a
+Checks a tutorial leaves to you: 1 Identity asks the group first, then the group words (five
+words with a checksum, generated on the first Pi and entered on the others), then the ID, and refuses a
 group or ID that is not lowercase letters and digits (group at most 27 characters; ID at most
 63, with at least one letter), or an ID equal to the group, and asks again; install stops when
 caddy cannot be installed (get online and run it again); `mesh-config update` reinstalls from
