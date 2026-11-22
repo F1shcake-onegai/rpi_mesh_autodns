@@ -18,9 +18,11 @@ an iPhone. Full page (5.2 MB) loaded in ~13 s.
     re-registered device.
   - Consider adding `interface-name:<uplink_if>` to `unmanaged-devices` in
     99-mesh.conf while uplink=ap (keeps it unmanaged across firmware restarts).
-- [ ] **Encryption (later)**: the access point is open and the ad-hoc mesh is
-      open, on purpose, until the network and encryption design is decided. Do not
-      ask about a password before then. Leftover: `ap_psk` in mesh.conf is unused.
+- [ ] **Encryption (later)**: the access point is open, on purpose, until the network
+      and encryption design is decided. Do not ask about a password before then.
+      Leftover: `ap_psk` in mesh.conf is unused.
+  - Mesh radio (Pi to Pi): encryption is left out. We believe it is not currently
+    required in a classroom setting (decided 2026-11-22).
   - Gateway spoofing: a node can announce another node's gateway MAC (`mac=` in
     its `_groupmesh` record; gateway MACs are visible via `batctl gwl`) with its
     own IP. `peer_ip` then returns that node's address, and `gateway_off` sends
@@ -31,6 +33,9 @@ an iPhone. Full page (5.2 MB) loaded in ~13 s.
 - [ ] **Peer status page**: interactive page at `http://<group>.mesh/` showing which
       peers are online (today: static list rebuilt by `mesh-hosts.sh` every minute
       in `/var/www/mesh/index.html`).
+  - Map layout (decided 2026-11-22): the Pi serving the page sits on the left, Pis
+    with internet or a Wi-Fi access point on the right, the others in between. Kept
+    for now on the guess that few Pis will have a second radio.
 - [ ] **`mesh-config fix`** (or `configure`): repair a badly done or half-finished
       install (missing files, wrong service states) without a full reinstall.
 

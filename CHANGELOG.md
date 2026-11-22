@@ -1,5 +1,27 @@
 # Changelog
 
+## 20261122+01
+
+First step towards the map on the index page: the data source only. Nothing shows it in
+the browser yet.
+
+### Added
+- Map data source: while the mesh is on, every Pi runs `alfred` and `batadv-vis`
+  (`mesh-alfred.service`, `mesh-vis.service`; started by `mesh-up`, stopped with the mesh).
+  Every 10 seconds each Pi reports the Pis it hears directly, and alfred carries that to all
+  other Pis, so any Pi can print the whole picture with `sudo batadv-vis`.
+- Install adds the `alfred` package (without its recommended graphviz). The mesh runs without
+  it; `mesh-up` then warns `alfred not installed: no map data (run install)`.
+- Status (8) shows the map data: every Pi that reports and the Pis it hears, with the link
+  cost (1.000 is a perfect link, larger is worse).
+- Warning `br0 has no IPv6 link-local address: no map data` (alfred talks over IPv6
+  link-local multicast).
+
+### Changed
+- `mesh-config.sh`: one coding style and comments throughout, no functional change.
+- todo: the mesh radio stays unencrypted, with the reason; the map layout decided for the
+  index page.
+
 ## 20261104+02
 
 ### Fixed

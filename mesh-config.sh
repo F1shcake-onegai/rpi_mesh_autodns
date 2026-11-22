@@ -17,6 +17,7 @@
 #                              the radio can, else 2.4 GHz (radios without AP mode refuse it)
 #   names          clients resolve <group>.mesh only; peers (avahi) go to this Pi's /etc/hosts
 #   web            caddy serves <group>.mesh: /home/<id>/public, other nodes proxied at /<id>/
+#   map data       alfred carries every Pi's list of the Pis it hears (batadv-vis) to all Pis
 #   hot plug       udev starts and stops the uplink role with the radio
 #   failure        checks before any radio is touched; mesh-down.sh runs as
 #                  ExecStopPost, so the mesh radio returns to NetworkManager
@@ -49,7 +50,8 @@
 # Files written by install (6 Install):
 #   /usr/local/sbin/mesh-{up,down,uplink,role,hosts}.sh and /usr/local/lib/mesh/{common.sh,version.txt}
 #   /etc/systemd/system/mesh.service, mesh-uplink@.service, mesh-role-check.{service,timer},
-#     mesh-hosts.{service,timer}, mesh-restore.service, caddy.service.d/mesh.conf
+#     mesh-hosts.{service,timer}, mesh-restore.service, mesh-alfred.service, mesh-vis.service,
+#     caddy.service.d/mesh.conf
 #   /etc/mesh/*.tpl (dnsmasq, hostapd and nftables templates), /etc/mesh/meshdhcp.nft, /etc/caddy/Caddyfile
 #   /etc/NetworkManager/conf.d/99-mesh.conf, /etc/NetworkManager/dispatcher.d/50-mesh-dns
 #   /etc/udev/rules.d/90-mesh-uplink.rules, /etc/mesh/avahi-daemon.conf (copied to /etc/avahi by
@@ -382,6 +384,12 @@ write_system_files() (
   if ! command -v caddy >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y caddy >/dev/null 2>&1 || true
     command -v caddy >/dev/null 2>&1 || fail "caddy is not installed: connect to the internet and run install again"
+  fi
+  # alfred (with batadv-vis) for the map data: optional, the mesh runs without it. Its
+  # recommended package is graphviz, which nothing here uses
+  if ! command -v batadv-vis >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends alfred >/dev/null 2>&1 \
+      || echo "WARNING: alfred is not installed: no map data" >&2
   fi
   # caddy must run as a service on /etc/caddy/Caddyfile (a manual install may not)
   err=0
@@ -890,6 +898,14 @@ fi
 if command -v caddy >/dev/null 2>&1; then
   systemctl restart --no-block caddy || warn "caddy failed to start"
 fi
+# map data: alfred and batadv-vis, queued like caddy. alfred talks over IPv6 link-local
+# multicast; the kernel gives br0 that address by itself
+if [ -x /usr/sbin/alfred ] && [ -x /usr/sbin/batadv-vis ]; then
+  ip -6 -o addr show dev br0 scope link 2>/dev/null | grep -q . || warn "br0 has no IPv6 link-local address: no map data"
+  systemctl restart --no-block mesh-alfred.service mesh-vis.service || warn "map data services failed to start"
+else
+  warn "alfred not installed: no map data (run install)"
+fi
 
 # 6. Uplink role (separate unit, started by udev when the radio appears)
 touch "$RUN/up"
@@ -947,7 +963,7 @@ UPLINK_IF=$(cat "$RUN/uplink" 2>/dev/null || true)
 # Services, firewall tables, state files and the peer names in /etc/hosts
 rm -f "$RUN/up"   # first: mesh-role.sh and the uplink check do nothing without it
 systemctl stop 'mesh-uplink@*.service' 2>/dev/null
-systemctl stop mesh-role-check.timer mesh-hosts.timer hostapd caddy 2>/dev/null
+systemctl stop mesh-role-check.timer mesh-hosts.timer mesh-vis.service mesh-alfred.service hostapd caddy 2>/dev/null
 nft delete table inet meshgw 2>/dev/null
 nft delete table bridge meshdhcp 2>/dev/null
 rm -f "$RUN/uplink" "$RUN/gateway" "$MOTD" "$WARN"
@@ -1312,6 +1328,35 @@ After=mesh.service
 OnActiveSec=15
 OnUnitActiveSec=1min
 EOF
+  # map data: both run only while the mesh is on (started by mesh-up.sh, like caddy;
+  # the package ships no units). Every Pi's batadv-vis hands the Pis it hears directly
+  # to its alfred, and alfred passes that on to every other Pi
+  cat > /etc/systemd/system/mesh-alfred.service <<'EOF'
+[Unit]
+Description=alfred: carries small facts (the map data) between the Pis of the mesh
+ConditionPathExists=/usr/sbin/alfred
+After=mesh.service
+PartOf=mesh.service
+
+[Service]
+# on br0, the bridge bat0 is a port of; primary mode (-m) on every Pi, so no Pi depends on another
+ExecStart=/usr/sbin/alfred -i br0 -b bat0 -m
+# alfred exits when it cannot open br0 yet
+Restart=on-failure
+RestartSec=5
+EOF
+  cat > /etc/systemd/system/mesh-vis.service <<'EOF'
+[Unit]
+Description=batadv-vis: reports the Pis this one hears to alfred every 10 seconds
+ConditionPathExists=/usr/sbin/batadv-vis
+After=mesh.service mesh-alfred.service
+PartOf=mesh.service
+
+[Service]
+ExecStart=/usr/sbin/batadv-vis -i bat0 -s
+Restart=on-failure
+RestartSec=5
+EOF
   # every boot, before avahi (which then starts with the restored settings) and the
   # mesh: mesh-down never ran if the power went while the mesh was on
   cat > /etc/systemd/system/mesh-restore.service <<'EOF'
@@ -1388,7 +1433,7 @@ uninstall_mesh() (
   elif [ -x /usr/local/sbin/mesh-down.sh ]; then
     /usr/local/sbin/mesh-down.sh
   fi
-  systemctl stop mesh-hosts.timer mesh-role-check.timer 'mesh-uplink@*.service' 2>/dev/null
+  systemctl stop mesh-hosts.timer mesh-role-check.timer mesh-vis.service mesh-alfred.service 'mesh-uplink@*.service' 2>/dev/null
   systemctl disable mesh.service mesh-hosts.timer mesh-role-check.timer >/dev/null 2>&1
   systemctl disable mesh-restore.service >/dev/null 2>&1   # not there before 20261028+1
   # what the first install recorded, read before /etc/mesh goes; empty after an
@@ -1402,6 +1447,7 @@ uninstall_mesh() (
         /etc/systemd/system/mesh-role-check.service /etc/systemd/system/mesh-role-check.timer \
         /etc/systemd/system/mesh-hosts.service /etc/systemd/system/mesh-hosts.timer \
         /etc/systemd/system/mesh-restore.service /etc/systemd/system/caddy.service.d/mesh.conf \
+        /etc/systemd/system/mesh-alfred.service /etc/systemd/system/mesh-vis.service \
         /etc/NetworkManager/conf.d/99-mesh.conf /etc/NetworkManager/dispatcher.d/50-mesh-dns \
         /etc/udev/rules.d/90-mesh-uplink.rules /etc/avahi/services/groupmesh.service \
         /etc/tmpfiles.d/mesh.conf /etc/sysctl.d/90-mesh.conf /etc/modules-load.d/batman.conf \
@@ -1472,7 +1518,7 @@ uninstall_mesh() (
 
   echo
   echo "mesh-config is uninstalled. Kept:"
-  echo "  packages: batctl hostapd dnsmasq avahi-daemon avahi-utils iputils-arping nftables curl iw bridge-utils caddy whiptail"
+  echo "  packages: batctl hostapd dnsmasq avahi-daemon avahi-utils iputils-arping nftables curl iw bridge-utils caddy whiptail alfred"
   echo "  users created for node ids, their /home/<id>/public folders, /var/www/mesh and $CONF"
 )
 
@@ -1765,6 +1811,20 @@ menu_wifi() {
   read -rp "Press Enter to continue"
 }
 
+# Map data as alfred holds it: every Pi that reports, and the Pis it hears directly with
+# the link cost (1.000 is a perfect link, larger is worse). Names from /etc/hosts.mesh,
+# else the MAC.
+show_map_data() {
+  command -v batadv-vis >/dev/null 2>&1 || { echo "  alfred is not installed (6 Install)"; return 0; }
+  timeout 5 batadv-vis -f json 2>/dev/null | awk -F'"' '
+    BEGIN { while ((getline l < "/etc/hosts.mesh") > 0) { split(l, f, " "); sub(/\.mesh$/, "", f[2]); name[f[3]] = f[2] } }
+    function nm(mac) { return (mac in name) ? name[mac] : mac }
+    $2 == "primary" && !($4 in pi) { pi[$4] = 1; order[++n] = $4 }
+    $2 == "router" && $6 == "neighbor" { heard[$4] = heard[$4] "  " nm($8) " " $12 }
+    END { if (!n) print "  none yet"
+          for (i = 1; i <= n; i++) print "  " nm(order[i]) " hears:" (heard[order[i]] != "" ? heard[order[i]] : "  nobody") }'
+}
+
 # 8 Status: settings, services, radios, addresses, routes, peers, warnings and the
 # recent log on one page (also "mesh-config status").
 show_status() {
@@ -1793,6 +1853,7 @@ show_status() {
     echo; echo "Gateway mode: $(batctl gw_mode 2>/dev/null)"
     echo; echo "Mesh neighbours (batctl o):"; batctl o 2>/dev/null | tail -n +2 | head -20
     echo; echo "Gateways (batctl gwl):"; batctl gwl 2>/dev/null
+    echo; echo "Map data (alfred: $(systemctl is-active mesh-alfred 2>/dev/null), batadv-vis: $(systemctl is-active mesh-vis 2>/dev/null)):"; show_map_data
     echo; echo "Peers (/etc/hosts.mesh, this Pi only):"; cat /etc/hosts.mesh 2>/dev/null
     echo; echo "Upstream DNS:"; cat /run/dnsmasq/upstream.conf 2>/dev/null
     if [ -s "$WARN_FILE" ]; then echo; echo "Warnings:"; sed 's/^/  /' "$WARN_FILE"; fi
