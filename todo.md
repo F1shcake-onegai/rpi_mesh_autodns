@@ -31,8 +31,9 @@ an iPhone. Full page (5.2 MB) loaded in ~13 s.
       other uplink; mesh services (DHCP, DNS, web) never answer on it. For personal
       PCs or routers on the uplink, let the user choose whether to host there.
 - [ ] **Peer status page**: interactive page at `http://<group>.mesh/` showing which
-      peers are online (today: static list rebuilt by `mesh-hosts.sh` every minute
-      in `/var/www/mesh/index.html`).
+      peers are online. Built in 20261122+02 (list and map, from
+      `/var/www/mesh/_mesh/map.json`); not yet checked on real Pis. Still to add: the
+      chain line on authors' pages.
   - Map layout (decided 2026-11-22): the Pi serving the page sits on the left, Pis
     with internet or a Wi-Fi access point on the right, the others in between. Kept
     for now on the guess that few Pis will have a second radio.

@@ -17,6 +17,8 @@
 #                              the radio can, else 2.4 GHz (radios without AP mode refuse it)
 #   names          clients resolve <group>.mesh only; peers (avahi) go to this Pi's /etc/hosts
 #   web            caddy serves <group>.mesh: /home/<id>/public, other nodes proxied at /<id>/
+#   index page     <group>.mesh/ lists the Pis that are online and draws them as a map, from
+#                  /_mesh/map.json, which mesh-map.sh writes every 10 seconds
 #   map data       alfred carries every Pi's list of the Pis it hears (batadv-vis) to all Pis
 #   hot plug       udev starts and stops the uplink role with the radio
 #   failure        checks before any radio is touched; mesh-down.sh runs as
@@ -48,10 +50,11 @@
 # (IP name MAC, from the avahi record), else by the MAC formula.
 #
 # Files written by install (6 Install):
-#   /usr/local/sbin/mesh-{up,down,uplink,role,hosts}.sh and /usr/local/lib/mesh/{common.sh,version.txt}
+#   /usr/local/sbin/mesh-{up,down,uplink,role,hosts,map}.sh and /usr/local/lib/mesh/{common.sh,version.txt}
 #   /etc/systemd/system/mesh.service, mesh-uplink@.service, mesh-role-check.{service,timer},
 #     mesh-hosts.{service,timer}, mesh-restore.service, mesh-alfred.service, mesh-vis.service,
-#     caddy.service.d/mesh.conf
+#     mesh-map.service, caddy.service.d/mesh.conf
+#   /var/www/mesh/index.html (the index page) and /var/www/mesh/_mesh/fonts (its two fonts)
 #   /etc/mesh/*.tpl (dnsmasq, hostapd and nftables templates), /etc/mesh/meshdhcp.nft, /etc/caddy/Caddyfile
 #   /etc/NetworkManager/conf.d/99-mesh.conf, /etc/NetworkManager/dispatcher.d/50-mesh-dns
 #   /etc/udev/rules.d/90-mesh-uplink.rules, /etc/mesh/avahi-daemon.conf (copied to /etc/avahi by
@@ -63,7 +66,7 @@
 # Runtime state: /etc/default/mesh (ID, MYIP, GROUP, MESH_IF, MESH_BSSID), /run/mesh/{up,uplink,gateway,warnings},
 #   /run/motd.d/mesh (the warnings, shown at login),
 #   /run/dnsmasq/upstream.conf (dnsmasq forwarders), /etc/hosts.mesh (names found via mDNS,
-#   copied into a "mesh-peers" block in /etc/hosts).
+#   copied into a "mesh-peers" block in /etc/hosts), /var/www/mesh/_mesh/map.json (the map data).
 
 set -u
 # Settings file: on the boot partition, /boot/firmware or (older systems) /boot.
@@ -722,6 +725,352 @@ PartOf=mesh.service
 EnvironmentFile=/etc/default/mesh
 EOF
 
+  # --- index page: the same file on every Pi; what it shows comes from /_mesh/map.json.
+  #     Everything it needs is under /_mesh/, a path no node ID can take (IDs are a-z 0-9)
+  install -d /var/www/mesh/_mesh/fonts
+  cat > /var/www/mesh/index.html <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node Index</title>
+<style>
+  @font-face { font-family: 'Space Grotesk'; font-weight: 300 700; font-display: swap; src: url(/_mesh/fonts/SpaceGrotesk.ttf) format('truetype'); }
+  @font-face { font-family: 'Space Mono'; font-weight: 400; font-display: swap; src: url(/_mesh/fonts/SpaceMono-Regular.ttf) format('truetype'); }
+  :root { --bg: #FFEFD2; --edge: #e3cfa6; --ink: #1c1f23; --grey: #5f6368; --line: #bfb190; --accent: #1d6fd8; --gw: #0a7d4f;
+          --text: 'Space Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif; --mono: 'Space Mono', ui-monospace, 'DejaVu Sans Mono', Menlo, monospace; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { font: 15px/1.4 var(--text); color: var(--ink); background: var(--bg); }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--edge); }
+  header h1 { font-size: 18px; margin: 0; }
+  #status { color: var(--grey); font-size: 13px; white-space: nowrap; }
+  #stale { display: none; background: #fff4d6; color: #7a5200; padding: 6px 16px; font-size: 13px; border-bottom: 1px solid #f0dca0; }
+  main { display: flex; height: calc(100vh - 47px); min-height: 420px; }
+  /* list: two Pis side by side per line; each Pi is two rows, name then MAC. It scrolls on its own */
+  #list { list-style: none; margin: 0; padding: 0; flex: 0 0 360px; overflow-y: auto; border-right: 1px solid var(--edge);
+          display: grid; grid-template-columns: 1fr 1fr; align-content: start; }
+  #list li { min-width: 0; border-bottom: 1px solid var(--edge); }
+  #list li:nth-child(odd) { border-right: 1px solid var(--edge); }
+  #list a, #list span.row { display: block; padding: 7px 12px; color: var(--ink); text-decoration: none; }
+  #list a:hover { background: #fbe3b6; }
+  #list .nm { display: block; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #list .mac2 { display: block; font: 12px var(--mono); color: var(--grey); }
+  #list .tag { font-size: 12px; font-weight: 400; color: var(--grey); margin-left: 6px; }
+  /* map */
+  #mapwrap { position: relative; flex: 1 1 auto; min-width: 0; }
+  #map { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
+  #map.panning { cursor: grabbing; }
+  #note { display: none; position: absolute; left: 0; right: 0; bottom: 18%; margin: 0; text-align: center; color: var(--grey); }
+  .link { stroke: var(--line); stroke-width: 1.3; transition: stroke .15s, stroke-width .15s, opacity .15s; }
+  .link.hot { stroke: #4b5563; stroke-width: 2.2; }
+  .link.leaving { opacity: 0; }
+  .node { transition: opacity .35s; }
+  .node.go { cursor: pointer; }
+  .node.leaving { opacity: 0; }
+  .node .inner.new { animation: drop .7s ease-out; }
+  @keyframes drop { from { opacity: 0; transform: translateY(-36px); } to { opacity: 1; transform: none; } }
+  .dot { fill: var(--ink); transform-box: fill-box; transform-origin: center; transition: transform .15s; }
+  .node.hot .dot { transform: scale(1.35); }
+  .ring { fill: none; stroke: var(--accent); stroke-width: 2; }
+  .name { font-weight: 600; font-size: 12px; text-anchor: middle; fill: var(--ink); }
+  .mac { font: 10px var(--mono); text-anchor: middle; fill: var(--grey); }
+  .here { font-size: 11px; font-weight: 600; text-anchor: middle; fill: var(--accent); }
+  .tagbox { stroke-width: 1; fill: #f7e4bb; stroke: #7a6a45; }
+  .tagtext { font-size: 10px; font-weight: 600; text-anchor: middle; fill: #5a4b28; }
+  .tagbox.internet { fill: #e7f6ef; stroke: var(--gw); }
+  .tagtext.internet { fill: var(--gw); }
+  .node text { paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; }
+  .node .tagtext { stroke: none; }
+  @media (max-width: 700px) {            /* phone: the list on top, the map under it */
+    main { flex-direction: column; height: auto; }
+    #list { flex: 0 0 auto; max-height: 30vh; border-right: 0; border-bottom: 1px solid var(--edge); }
+    #mapwrap { height: 62vh; min-height: 380px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1 id="title">Live Node Index</h1>
+  <div id="status"></div>
+</header>
+<div id="stale">Map not updating</div>
+<noscript><p style="padding: 0 16px">This page needs JavaScript to show the Pis on the mesh.</p></noscript>
+
+<main>
+  <ul id="list"></ul>
+  <div id="mapwrap">
+    <svg id="map" role="img" aria-label="Map of the Pis on the mesh"><g id="view"><g id="links"></g><g id="nodes"></g></g></svg>
+    <p id="note"></p>
+  </div>
+</main>
+
+<script>
+// Index page of the mesh. Reads /_mesh/map.json (written every 10 seconds by mesh-map.sh on
+// the Pi that serves this page) and draws the Pis that are online: a list on the left,
+// a map on the right. The Pi serving the page sits on the left edge of the map, Pis with
+// internet or a Wi-Fi access point on the right edge, the others in between by hops.
+const DATA = '/_mesh/map.json', POLL = 5000, STALE = 30;
+const SVGNS = 'http://www.w3.org/2000/svg';
+const svg = document.getElementById('map'), gView = document.getElementById('view');
+const gLinks = document.getElementById('links'), gNodes = document.getElementById('nodes');
+let nodes = [], links = [], group = '';
+
+// Fixed seed: the same Pis give the same arrangement on every load.
+function rng(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+let rand = rng(20261122);
+
+// ---- layout ----
+const LEFT = -380, RIGHT = 380;
+const special = n => (n.gw || n.ap) && !n.you;                // goes to the right edge
+const narrow = () => window.innerWidth < 600;
+// Hops from the given Pis to every Pi they can reach.
+function hops(from) {
+  const d = new Map(from.map(n => [n, 0])), queue = [...from];
+  while (queue.length) {
+    const n = queue.shift();
+    for (const l of links) { const m = l.a === n ? l.b : l.b === n ? l.a : null; if (m && !d.has(m)) { d.set(m, d.get(n) + 1); queue.push(m); } }
+  }
+  return d;
+}
+// Where each Pi belongs between the two edges: the more hops from "you are here", the further right.
+function targets() {
+  const dl = hops(nodes.filter(n => n.you));
+  const far = Math.max(1, ...nodes.filter(n => !n.you && !special(n) && dl.has(n)).map(n => dl.get(n)));
+  for (const n of nodes) {
+    n.pin = n.you || special(n);
+    const a = Math.min(dl.has(n) ? dl.get(n) : far, far);
+    n.tx = LEFT + (RIGHT - LEFT) * (n.you ? 0 : special(n) ? 1 : 0.16 + 0.54 * (far > 1 ? (a - 1) / (far - 1) : 0.5));
+  }
+}
+// Right edge: one slot per Pi, in columns of seven, ordered by where their neighbours sit.
+function slotRight() {
+  const right = nodes.filter(special);
+  const want = n => { const ys = links.filter(l => l.a === n || l.b === n).map(l => (l.a === n ? l.b : l.a).y); return ys.length ? ys.reduce((a, b) => a + b) / ys.length : 0; };
+  right.map(n => [want(n), n]).sort((a, b) => a[0] - b[0]).forEach(([, n], i) => {
+    const col = Math.floor(i / 7), inCol = Math.min(7, right.length - col * 7);
+    n.x = RIGHT + col * 150; n.y = (i % 7 - (inCol - 1) / 2) * 100;
+  });
+}
+// Linked Pis pull together, all Pis push apart (more sideways: labels are wider than tall).
+function relax(steps, heat, free) {
+  for (let s = 0; s < steps; s++) {
+    const a = heat * (1 - s / steps);
+    for (const p of nodes) { p.fx = (p.tx - p.x) * 0.14; p.fy = -p.y * 0.012; }
+    for (let i = 0; i < nodes.length; i++) for (let j = i + 1; j < nodes.length; j++) {
+      const p = nodes[i], q = nodes[j];
+      const dx = (p.x - q.x) / 1.5 || 0.1, dy = p.y - q.y || 0.1, d2 = dx * dx + dy * dy, d = Math.sqrt(d2), f = 5200 / d2;
+      p.fx += dx / d * f; p.fy += dy / d * f; q.fx -= dx / d * f; q.fy -= dy / d * f;
+    }
+    for (const l of links) {
+      const dx = l.b.x - l.a.x, dy = l.b.y - l.a.y, d = Math.hypot(dx, dy) || 1, f = (d - 135) * 0.12;
+      l.a.fx += dx / d * f; l.a.fy += dy / d * f; l.b.fx -= dx / d * f; l.b.fy -= dy / d * f;
+    }
+    for (const p of nodes) {
+      if (p.pin || (free && !free.has(p))) continue;
+      const m = Math.hypot(p.fx, p.fy), cap = m > 30 ? 30 / m : 1;
+      p.x += p.fx * cap * a; p.y += p.fy * cap * a;
+    }
+  }
+}
+// Number of line pairs that cross.
+function crossings() {
+  const side = (p, q, r) => Math.sign((q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x));
+  let c = 0;
+  for (let i = 0; i < links.length; i++) for (let j = i + 1; j < links.length; j++) {
+    const a = links[i], b = links[j];
+    if (a.a === b.a || a.a === b.b || a.b === b.a || a.b === b.b) continue;
+    if (side(a.a, a.b, b.a) !== side(a.a, a.b, b.b) && side(b.a, b.b, a.a) !== side(b.a, b.b, a.b)) c++;
+  }
+  return c;
+}
+// Push apart Pis whose labels would overlap (only the Pis in "free", when given).
+function spread(free) {
+  const hw = narrow() ? 44 : 62, hh = 45;
+  for (let s = 0; s < 300; s++) {
+    let hit = false;
+    for (let i = 0; i < nodes.length; i++) for (let j = i + 1; j < nodes.length; j++) {
+      const p = nodes[i], q = nodes[j], dx = q.x - p.x, dy = q.y - p.y, ox = 2 * hw - Math.abs(dx), oy = 2 * hh - Math.abs(dy);
+      if (ox <= 0 || oy <= 0) continue;
+      const mp = !p.pin && (!free || free.has(p)), mq = !q.pin && (!free || free.has(q)), share = mp && mq ? 0.5 : 1;
+      if (!mp && !mq) continue;
+      hit = true;
+      if (ox < oy) { const d = (dx < 0 ? -ox : ox) * share; if (mp) p.x -= d; if (mq) q.x += d; }
+      else         { const d = (dy < 0 ? -oy : oy) * share; if (mp) p.y -= d; if (mq) q.y += d; }
+    }
+    if (!hit) break;
+  }
+}
+// Full layout: several random starts, the one with the fewest crossing lines wins.
+function layout() {
+  rand = rng(20261122);
+  targets();
+  let best = null;
+  for (let t = 0; t < 40; t++) {
+    for (const n of nodes) { n.x = n.tx + (rand() - .5) * 60; n.y = n.you ? 0 : (rand() - .5) * 500; }
+    slotRight(); relax(250, 1); slotRight(); relax(250, 0.6);
+    const c = crossings();
+    if (!best || c < best.c) best = { c, pos: nodes.map(n => [n.x, n.y]) };
+    if (c === 0) break;
+  }
+  nodes.forEach((n, i) => { [n.x, n.y] = best.pos[i]; });
+  spread();
+}
+
+// ---- pan and zoom ----
+const view = { x: 0, y: 0, k: 1 };
+let touched = false;                                          // the visitor moved the map: no automatic re-fit
+const applyView = () => gView.setAttribute('transform', `translate(${view.x},${view.y}) scale(${view.k})`);
+function fit() {
+  const r = svg.getBoundingClientRect();
+  if (!nodes.length || !r.width) return;
+  const xs = nodes.map(n => n.x), ys = nodes.map(n => n.y);
+  const x0 = Math.min(...xs) - 75, x1 = Math.max(...xs) + 75, y0 = Math.min(...ys) - 45, y1 = Math.max(...ys) + 60;
+  view.k = Math.max(Math.min(r.width / (x1 - x0), r.height / (y1 - y0), 1.4), 0.3);
+  view.x = r.width / 2 - view.k * (x0 + x1) / 2; view.y = r.height / 2 - view.k * (y0 + y1) / 2;
+  applyView();
+}
+function zoomAt(mx, my, f) {
+  const k = Math.min(Math.max(view.k * f, 0.3), 4); f = k / view.k;
+  view.x = mx - (mx - view.x) * f; view.y = my - (my - view.y) * f; view.k = k; applyView(); touched = true;
+}
+svg.addEventListener('wheel', e => { e.preventDefault(); const r = svg.getBoundingClientRect();
+  zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015)); }, { passive: false });
+const ptrs = new Map(); let moved = 0;
+svg.addEventListener('pointerdown', e => { if (!ptrs.size) moved = 0; ptrs.set(e.pointerId, [e.clientX, e.clientY]); svg.classList.add('panning'); });
+window.addEventListener('pointermove', e => {
+  if (!ptrs.has(e.pointerId)) return;
+  const prev = ptrs.get(e.pointerId), r = svg.getBoundingClientRect();
+  if (ptrs.size === 1) {
+    view.x += e.clientX - prev[0]; view.y += e.clientY - prev[1]; moved += Math.abs(e.clientX - prev[0]) + Math.abs(e.clientY - prev[1]);
+    applyView(); if (moved > 6) touched = true;
+  } else if (ptrs.size === 2) {
+    const other = [...ptrs.entries()].find(([id]) => id !== e.pointerId)[1];
+    const d0 = Math.hypot(prev[0] - other[0], prev[1] - other[1]) || 1, d1 = Math.hypot(e.clientX - other[0], e.clientY - other[1]);
+    zoomAt((e.clientX + other[0]) / 2 - r.left, (e.clientY + other[1]) / 2 - r.top, d1 / d0); moved += 10;
+  }
+  ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+});
+const endPtr = e => { ptrs.delete(e.pointerId); if (!ptrs.size) svg.classList.remove('panning'); };
+window.addEventListener('pointerup', endPtr); window.addEventListener('pointercancel', endPtr);
+
+// ---- drawing ----
+const el = (tag, attrs, text) => { const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
+// "@display name", else "@id", else (no name known yet) the MAC.
+const label = n => n.name ? '@' + n.name : n.id ? '@' + n.id : n.mac;
+const url = n => n.id ? '/' + n.id + '/' : '';
+const roles = n => [n.gw ? 'internet' : '', n.ap ? 'wifi' : ''].filter(Boolean);
+function drawMap() {
+  gLinks.replaceChildren(); gNodes.replaceChildren();
+  for (const l of links) { l.el = el('line', { class: 'link', x1: l.a.x, y1: l.a.y, x2: l.b.x, y2: l.b.y }); gLinks.append(l.el); }
+  for (const n of nodes) {
+    const g = el('g', { class: 'node' + (n.id ? ' go' : ''), transform: `translate(${n.x},${n.y})` }); n.el = g;
+    const inner = el('g', { class: 'inner' + (n.fresh ? ' new' : '') }); n.fresh = false;
+    const r = roles(n), text = r.join(' + '), w = 12 + text.length * 5.6, cls = n.gw ? ' internet' : '';
+    if (n.you) inner.append(el('circle', { class: 'ring', r: 15 }), el('text', { class: 'here', y: -22 }, 'you are here'));
+    else if (r.length) inner.append(el('rect', { class: 'tagbox' + cls, x: -w / 2, y: -32, width: w, height: 16, rx: 8 }), el('text', { class: 'tagtext' + cls, y: -20.5 }, text));
+    inner.append(el('circle', { class: 'dot', r: 9 }), el('text', { class: 'name', y: 27 }, label(n)));
+    if (label(n) !== n.mac) inner.append(el('text', { class: 'mac', y: 40 }, narrow() ? n.mac.slice(9) : n.mac));
+    g.append(inner);
+    g.addEventListener('pointerenter', () => { g.classList.add('hot'); links.forEach(l => (l.a === n || l.b === n) && l.el.classList.add('hot')); });
+    g.addEventListener('pointerleave', () => { g.classList.remove('hot'); links.forEach(l => l.el.classList.remove('hot')); });
+    g.addEventListener('click', () => { if (moved < 6 && n.id) location.href = url(n); });
+    gNodes.append(g);
+  }
+}
+function drawList() {
+  const list = document.getElementById('list'); list.replaceChildren();
+  const span = (cls, text) => { const e = document.createElement('span'); e.className = cls; e.textContent = text; return e; };
+  for (const n of nodes.filter(n => !n.leaving).sort((a, b) => label(a).localeCompare(label(b)))) {
+    const li = document.createElement('li'), a = document.createElement(n.id ? 'a' : 'span'), nm = span('nm', label(n));
+    if (n.id) a.href = url(n); else a.className = 'row';
+    const tags = n.you ? ['you are here'] : roles(n);
+    if (tags.length) nm.append(span('tag', tags.join(', ')));
+    a.append(nm, span('mac2', label(n) === n.mac ? 'no name yet' : n.mac)); li.append(a); list.append(li);
+  }
+}
+
+// ---- data ----
+let stamp = null, changed = 0, layoutKey = '', pending = false;
+const now = () => Math.floor(performance.now() / 1000);
+function showStatus() {
+  const age = now() - changed, n = nodes.filter(x => !x.leaving).length, note = document.getElementById('note');
+  document.getElementById('status').textContent = stamp === null ? '' : `${n} ${n === 1 ? 'Pi' : 'Pis'} online · updated ${age} s ago`;
+  document.getElementById('stale').style.display = age >= STALE ? 'block' : 'none';
+  note.textContent = stamp === null ? 'Waiting for map data' : n <= 1 ? 'No other Pis found yet' : '';
+  note.style.display = note.textContent ? 'block' : 'none';
+}
+const okMac = s => /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(s), okId = s => /^[a-z0-9]{1,63}$/.test(s), okName = s => /^[A-Za-z0-9 ._-]{1,24}$/.test(s);
+// Take one map.json. Pis that are gone fade out first (their lines at once), then the rest is drawn.
+function take(data) {
+  if (typeof data.group === 'string' && /^[a-z0-9]{1,27}$/.test(data.group) && data.group !== group) {
+    group = data.group; document.title = group + ' - Node Index';
+    document.getElementById('title').textContent = group + '.mesh - Live Node Index';
+  }
+  const seen = new Map();
+  for (const d of Array.isArray(data.nodes) ? data.nodes : []) if (d && okMac(d.mac) && !seen.has(d.mac)) seen.set(d.mac, d);
+  const gone = nodes.filter(n => !seen.has(n.mac));
+  const rest = () => {
+    const first = !nodes.length, old = new Map(nodes.map(n => [n.mac, n])), fresh = new Set();
+    nodes = [...seen.values()].map(d => {
+      const n = old.get(d.mac) || { mac: d.mac, x: 0, y: 0, fresh: !first };
+      if (!old.has(d.mac)) fresh.add(n);
+      n.id = typeof d.id === 'string' && okId(d.id) ? d.id : ''; n.name = typeof d.name === 'string' && okName(d.name) ? d.name : '';
+      n.gw = d.gw === true; n.ap = d.ap === true; n.you = d.mac === data.self; n.leaving = false;
+      return n;
+    });
+    const by = new Map(nodes.map(n => [n.mac, n]));
+    links = (Array.isArray(data.links) ? data.links : []).filter(l => l && by.has(l.a) && by.has(l.b) && l.a !== l.b).map(l => ({ a: by.get(l.a), b: by.get(l.b) }));
+    // a full layout when the edges change (who is "you", who sits on the right) or on the first data;
+    // otherwise every Pi keeps its place and only new ones are fitted in
+    const key = nodes.filter(n => n.you || special(n)).map(n => n.mac + (n.you ? '*' : '')).sort().join(' ');
+    if (first || key !== layoutKey) { layoutKey = key; layout(); if (!touched) fit(); }
+    else if (fresh.size) {
+      targets();
+      for (const n of fresh) { const l = links.find(l => l.a === n || l.b === n), near = l && (l.a === n ? l.b : l.a);
+        n.x = near && !fresh.has(near) ? near.x + 50 : n.tx; n.y = near && !fresh.has(near) ? near.y + 60 : 0; }
+      relax(160, 0.6, fresh); spread(fresh);
+    }
+    drawMap(); drawList(); showStatus(); pending = false;
+  };
+  if (gone.length && !pending) {
+    pending = true;
+    for (const n of gone) { n.leaving = true; if (n.el) n.el.classList.add('leaving');
+      links.forEach(l => (l.a === n || l.b === n) && l.el && l.el.classList.add('leaving')); }
+    drawList(); showStatus(); setTimeout(rest, 380);
+  } else if (!pending) rest();
+}
+async function poll() {
+  try {
+    const res = await fetch(DATA, { cache: 'no-store' });
+    if (res.ok) { const data = await res.json(); if (data && data.stamp !== stamp) { stamp = data.stamp; changed = now(); take(data); } }
+  } catch (e) { /* the Pi did not answer: the status line keeps counting, the warning bar comes after 30 s */ }
+}
+window.addEventListener('resize', () => { if (nodes.length) { drawMap(); if (!touched) fit(); } });
+showStatus(); poll(); setInterval(poll, POLL); setInterval(showStatus, 1000);
+</script>
+</body>
+</html>
+EOF
+  # its fonts (Space Grotesk and Space Mono, SIL Open Font License): the copies next to this
+  # script, else from GitHub once. Without them the page uses the device's own fonts
+  for f in SpaceGrotesk.ttf SpaceMono-Regular.ttf; do
+    if [ -f "$(dirname "$SELF")/fonts/$f" ]; then
+      install -m 644 "$(dirname "$SELF")/fonts/$f" "/var/www/mesh/_mesh/fonts/$f"
+    elif [ ! -s "/var/www/mesh/_mesh/fonts/$f" ]; then
+      if curl -fsSL --max-time 60 -o "/var/www/mesh/_mesh/fonts/$f.new" "$UPDATE_URL/fonts/$f"; then
+        mv -f "/var/www/mesh/_mesh/fonts/$f.new" "/var/www/mesh/_mesh/fonts/$f"
+      else
+        rm -f "/var/www/mesh/_mesh/fonts/$f.new"
+        echo "WARNING: font $f not downloaded: the index page uses the device's own fonts" >&2
+      fi
+    fi
+  done
+
   # --- scripts
   cat > /usr/local/sbin/mesh-up.sh <<'EOF'
 #!/bin/bash
@@ -874,9 +1223,10 @@ printf 'ID=%s\nMYIP=%s\nGROUP=%s\nMESH_IF=%s\nMESH_BSSID=%s\n' "$ID" "$MYIP" "$G
 install -d /run/dnsmasq; : > /run/dnsmasq/upstream.conf
 touch /etc/hosts.mesh
 render "$TPL/groupmesh.service.tpl" /etc/avahi/services/groupmesh.service MAC="$MAC"
-# directory page: a placeholder until mesh-hosts.sh writes the list of nodes
-install -d /var/www/mesh
+# index page: install wrote it (a placeholder if it is missing); no map data from the last run
+install -d /var/www/mesh/_mesh
 [ -e /var/www/mesh/index.html ] || echo "<h1>$GROUP</h1>" > /var/www/mesh/index.html
+rm -f /var/www/mesh/_mesh/map.json
 systemctl restart dnsmasq || { journalctl -t dnsmasq -n 5 --no-pager >&2 || true; fail "dnsmasq failed to start"; }
 grep -qx 'nameserver 127.0.0.1' /etc/resolv.conf 2>/dev/null \
   || { rm -f /etc/resolv.conf; printf 'nameserver 127.0.0.1\nsearch mesh\n' > /etc/resolv.conf; }
@@ -906,6 +1256,8 @@ if [ -x /usr/sbin/alfred ] && [ -x /usr/sbin/batadv-vis ]; then
 else
   warn "alfred not installed: no map data (run install)"
 fi
+# the map data loop runs either way: without alfred it still lists the Pis, by MAC only
+[ -x /usr/local/sbin/mesh-map.sh ] && { systemctl restart --no-block mesh-map.service || warn "mesh-map failed to start"; }
 
 # 6. Uplink role (separate unit, started by udev when the radio appears)
 touch "$RUN/up"
@@ -963,7 +1315,7 @@ UPLINK_IF=$(cat "$RUN/uplink" 2>/dev/null || true)
 # Services, firewall tables, state files and the peer names in /etc/hosts
 rm -f "$RUN/up"   # first: mesh-role.sh and the uplink check do nothing without it
 systemctl stop 'mesh-uplink@*.service' 2>/dev/null
-systemctl stop mesh-role-check.timer mesh-hosts.timer mesh-vis.service mesh-alfred.service hostapd caddy 2>/dev/null
+systemctl stop mesh-role-check.timer mesh-hosts.timer mesh-map.service mesh-vis.service mesh-alfred.service hostapd caddy 2>/dev/null
 nft delete table inet meshgw 2>/dev/null
 nft delete table bridge meshdhcp 2>/dev/null
 rm -f "$RUN/uplink" "$RUN/gateway" "$MOTD" "$WARN"
@@ -1214,10 +1566,9 @@ EOF
 
   cat > /usr/local/sbin/mesh-hosts.sh <<'EOF'
 #!/bin/bash
-# Rebuild /etc/hosts.mesh from mDNS, the peer block in /etc/hosts (this Pi's
-# own lookups: caddy's proxy, ssh; dnsmasq does not serve it) and the directory
-# page. Names come from any host on the open mesh: only valid ids with an IPv4
-# address are taken, which also keeps markup out of the page.
+# Rebuild /etc/hosts.mesh from mDNS, and the peer block in /etc/hosts (this Pi's
+# own lookups: caddy's proxy, ssh; dnsmasq does not serve it). Names come from any
+# host on the open mesh: only valid ids with an IPv4 address are taken.
 systemctl is-active --quiet mesh.service || exit 0
 . /usr/local/lib/mesh/common.sh
 load_conf
@@ -1239,22 +1590,104 @@ avahi-browse -trp _groupmesh._tcp 2>/dev/null \
 } > /etc/hosts.new
 # written only when something changed
 if cmp -s /etc/hosts.new /etc/hosts; then rm -f /etc/hosts.new; else cat /etc/hosts.new > /etc/hosts; rm -f /etc/hosts.new; fi
-# /etc/hosts.mesh and the directory page: also only when the list changed
-if ! cmp -s /etc/hosts.mesh.new /etc/hosts.mesh; then
-  mv /etc/hosts.mesh.new /etc/hosts.mesh
-  {
-    echo "<!doctype html><meta charset=utf-8><title>${GROUP}</title>"
-    echo "<h1>${GROUP} on the mesh</h1><ul>"
-    awk '{sub(/\.mesh$/,"",$2); print "<li><a href=\"/"$2"/\">"$2"</a></li>"}' /etc/hosts.mesh
-    echo "</ul>"
-  } > /var/www/mesh/index.html
-else
-  rm -f /etc/hosts.mesh.new
-fi
+# /etc/hosts.mesh: also only when the list changed
+if cmp -s /etc/hosts.mesh.new /etc/hosts.mesh; then rm -f /etc/hosts.mesh.new; else mv /etc/hosts.mesh.new /etc/hosts.mesh; fi
 exit 0
 EOF
+
+  cat > /usr/local/sbin/mesh-map.sh <<'EOF'
+#!/bin/bash
+# Map data for the index page: every 10 seconds, tell the other Pis this one's name and
+# roles, then write /var/www/mesh/_mesh/map.json with the Pis that are online and the
+# links between them. Runs while the mesh is on (mesh-map.service).
+#   alfred (data type 64)  one line per Pi, "id|mesh MAC|display name|roles", roles gw and/or ap
+#   batadv-vis             every Pi's list of the Pis it hears directly, with the link cost
+#   batctl o               how long ago this Pi last heard of each other Pi
+# Everything read from the mesh is checked before it goes into the file: any device on
+# the mesh can send alfred data.
+set -u
+. /usr/local/lib/mesh/common.sh
+OUT=/var/www/mesh/_mesh/map.json
+FACTS=64      # alfred data type of the "id|MAC|name|roles" lines (0 to 63 are reserved)
+GONE=15       # seconds without a sign of a Pi before it counts as offline
+umask 022
+install -d "${OUT%/*}"
+
+# One round: announce this Pi, collect, write the file.
+build() {
+  local mif mac name roles=""
+  load_conf                                  # every round: a display name set in the menu shows without a restart
+  mif=$(sed -n 's/^MESH_IF=//p' /etc/default/mesh 2>/dev/null)
+  mac=$(cat "/sys/class/net/$mif/address" 2>/dev/null) || return 0
+  name=${display:-}; [[ $name =~ ^[A-Za-z0-9\ ._-]{1,24}$ ]] || name=""
+  [ -e "$RUN/gateway" ] && roles=gw
+  [ -e "$RUN/uplink" ] && systemctl is-active --quiet hostapd && roles=${roles:+$roles,}ap
+  printf '%s|%s|%s|%s' "${id:-}" "$mac" "$name" "$roles" | alfred -s "$FACTS" 2>/dev/null
+  {
+    echo "S $mac $GROUP $(date +%s)"
+    batctl o -H 2>/dev/null | sed 's/^/O /'
+    alfred -r "$FACTS" 2>/dev/null | sed 's/^/F /'
+    batadv-vis -f json 2>/dev/null | sed 's/^/V /'
+  } | awk -v gone="$GONE" '
+    function ismac(s) { return length(s) == 17 && s ~ /^([0-9a-f][0-9a-f]:)+[0-9a-f][0-9a-f]$/ }
+    # S: this Pi.  "S MAC group time"
+    $1 == "S" { self = $2; group = $3; stamp = $4; next }
+    # O: best route to another Pi.  "O * MAC 0.380s (255) next-hop [wlan0]"
+    $1 == "O" { if ($2 == "*" && ismac($3) && $4 ~ /^[0-9.]+s$/) heard[$3] = $4 + 0; next }
+    # F: a line some Pi announced.  F { "sender", "id|MAC|name|roles" },
+    $1 == "F" {
+      if (!match($0, /", "/)) next
+      d = substr($0, RSTART + 4); sub(/" },?[ \t]*$/, "", d)
+      if (split(d, f, "|") != 4 || f[1] !~ /^[a-z0-9]+$/ || length(f[1]) > 63 || !ismac(f[2]) || f[2] in id) next
+      if (f[3] !~ /^[A-Za-z0-9 ._-]+$/ || length(f[3]) > 24) f[3] = ""
+      id[f[2]] = f[1]; name[f[2]] = f[3]; gw[f[2]] = (f[4] ~ /(^|,)gw(,|$)/); ap[f[2]] = (f[4] ~ /(^|,)ap(,|$)/)
+      next
+    }
+    # V: one Pi hears another.  V { "router" : "MAC", "neighbor" : "MAC", "label" : "1.016" }
+    $1 == "V" {
+      split($0, q, "\"")
+      if (q[2] == "router" && q[6] == "neighbor" && ismac(q[4]) && ismac(q[8]) && q[12] + 0 >= 1) { cost[q[4], q[8]] = q[12] + 0; hears[q[4]] = hears[q[4]] " " q[8] }
+      next
+    }
+    END {
+      if (!ismac(self)) exit 1
+      # online: this Pi, every Pi heard of lately, and every Pi an online Pi hears. A Pi that
+      # went away stays in the old lists for a while: not heard of for too long means offline
+      on[self] = 1
+      for (m in heard) if (heard[m] < gone) on[m] = 1
+      do {
+        more = 0
+        for (a in on) { k = split(hears[a], h, " "); for (i = 1; i <= k; i++) if (!(h[i] in on) && !(h[i] in heard && heard[h[i]] >= gone)) { on[h[i]] = 1; more = 1 } }
+      } while (more)
+      # lines: for every Pi its three best links to online Pis (lowest cost); a line is drawn once
+      for (a in on) {
+        k = split(hears[a], h, " ")
+        for (pick = 1; pick <= 3; pick++) {
+          best = ""
+          for (i = 1; i <= k; i++) if (h[i] in on && h[i] != a && !((a, h[i]) in used) && (best == "" || cost[a, h[i]] < cost[a, best])) best = h[i]
+          if (best == "") break
+          used[a, best] = 1
+          lo = (a < best) ? a : best; hi = (a < best) ? best : a
+          if (!((lo, hi) in line) || cost[a, best] < line[lo, hi]) line[lo, hi] = cost[a, best]
+        }
+      }
+      printf "{\"group\":\"%s\",\"self\":\"%s\",\"stamp\":%d,\n\"nodes\":[", (group ~ /^[a-z0-9]+$/ ? group : ""), self, stamp
+      sep = ""
+      for (m in on) { printf "%s\n{\"mac\":\"%s\",\"id\":\"%s\",\"name\":\"%s\",\"gw\":%s,\"ap\":%s}", sep, m, id[m], name[m], (gw[m] ? "true" : "false"), (ap[m] ? "true" : "false"); sep = "," }
+      printf "],\n\"links\":["
+      sep = ""
+      for (l in line) { split(l, e, SUBSEP); printf "%s\n{\"a\":\"%s\",\"b\":\"%s\",\"cost\":%.3f}", sep, e[1], e[2], line[l]; sep = "," }
+      print "]}"
+    }' > "$OUT.new" && mv -f "$OUT.new" "$OUT"
+}
+
+while :; do
+  build
+  sleep 10
+done
+EOF
   chmod +x /usr/local/sbin/mesh-up.sh /usr/local/sbin/mesh-down.sh /usr/local/sbin/mesh-uplink.sh \
-           /usr/local/sbin/mesh-role.sh /usr/local/sbin/mesh-hosts.sh
+           /usr/local/sbin/mesh-role.sh /usr/local/sbin/mesh-hosts.sh /usr/local/sbin/mesh-map.sh
 
   # --- systemd units
   cat > /etc/systemd/system/mesh.service <<'EOF'
@@ -1357,6 +1790,18 @@ ExecStart=/usr/sbin/batadv-vis -i bat0 -s
 Restart=on-failure
 RestartSec=5
 EOF
+  # one long-running loop, not a timer: a timer would log two lines every 10 seconds
+  cat > /etc/systemd/system/mesh-map.service <<'EOF'
+[Unit]
+Description=Map data for the index page (/var/www/mesh/_mesh/map.json, every 10 seconds)
+After=mesh.service mesh-alfred.service mesh-vis.service
+PartOf=mesh.service
+
+[Service]
+ExecStart=/usr/local/sbin/mesh-map.sh
+Restart=on-failure
+RestartSec=5
+EOF
   # every boot, before avahi (which then starts with the restored settings) and the
   # mesh: mesh-down never ran if the power went while the mesh was on
   cat > /etc/systemd/system/mesh-restore.service <<'EOF'
@@ -1433,7 +1878,7 @@ uninstall_mesh() (
   elif [ -x /usr/local/sbin/mesh-down.sh ]; then
     /usr/local/sbin/mesh-down.sh
   fi
-  systemctl stop mesh-hosts.timer mesh-role-check.timer mesh-vis.service mesh-alfred.service 'mesh-uplink@*.service' 2>/dev/null
+  systemctl stop mesh-hosts.timer mesh-role-check.timer mesh-map.service mesh-vis.service mesh-alfred.service 'mesh-uplink@*.service' 2>/dev/null
   systemctl disable mesh.service mesh-hosts.timer mesh-role-check.timer >/dev/null 2>&1
   systemctl disable mesh-restore.service >/dev/null 2>&1   # not there before 20261028+1
   # what the first install recorded, read before /etc/mesh goes; empty after an
@@ -1442,12 +1887,12 @@ uninstall_mesh() (
 
   echo "Removing system files..."
   rm -f /usr/local/sbin/mesh-up.sh /usr/local/sbin/mesh-down.sh /usr/local/sbin/mesh-uplink.sh \
-        /usr/local/sbin/mesh-role.sh /usr/local/sbin/mesh-hosts.sh /usr/local/sbin/mesh-config \
+        /usr/local/sbin/mesh-role.sh /usr/local/sbin/mesh-hosts.sh /usr/local/sbin/mesh-map.sh /usr/local/sbin/mesh-config \
         /etc/systemd/system/mesh.service /etc/systemd/system/mesh-uplink@.service \
         /etc/systemd/system/mesh-role-check.service /etc/systemd/system/mesh-role-check.timer \
         /etc/systemd/system/mesh-hosts.service /etc/systemd/system/mesh-hosts.timer \
         /etc/systemd/system/mesh-restore.service /etc/systemd/system/caddy.service.d/mesh.conf \
-        /etc/systemd/system/mesh-alfred.service /etc/systemd/system/mesh-vis.service \
+        /etc/systemd/system/mesh-alfred.service /etc/systemd/system/mesh-vis.service /etc/systemd/system/mesh-map.service \
         /etc/NetworkManager/conf.d/99-mesh.conf /etc/NetworkManager/dispatcher.d/50-mesh-dns \
         /etc/udev/rules.d/90-mesh-uplink.rules /etc/avahi/services/groupmesh.service \
         /etc/tmpfiles.d/mesh.conf /etc/sysctl.d/90-mesh.conf /etc/modules-load.d/batman.conf \
@@ -1541,7 +1986,8 @@ apply_usb_gadget() {
 # 1 Identity: group, node ID, display name, Linux user. Group and ID take
 # lowercase letters and digits only (group at most 27 characters, so <group>-pis
 # fits an SSID; ID at most 63 with at least one letter, a hostname that useradd
-# takes) and must differ; anything else is asked again.
+# takes) and must differ. The display name (shown as @name on the index page) takes
+# letters, digits, spaces and . _ - only, at most 24. Anything else is asked again.
 menu_identity() {
   local id group display rc
   id=$(cfg_get id); group=$(cfg_get group)
@@ -1560,7 +2006,12 @@ menu_identity() {
     [ "$id" != "$group" ]    || { msg "ID must not be the same as the group name"; continue; }
     break
   done
-  display=$(ask "Enter a display name (optional)" "$(cfg_get display)") || return
+  display=$(cfg_get display)
+  while :; do
+    display=$(ask "Enter a display name (optional, shown on the index page)" "$display") || return
+    [[ $display =~ ^[A-Za-z0-9\ ._-]{0,24}$ ]] || { msg "Use only letters, digits, spaces and . _ - (at most 24 characters)"; continue; }
+    break
+  done
   cfg_set id "$id"; cfg_set group "$group"; cfg_set display "$display"
   if id -u "$id" >/dev/null 2>&1; then
     msg "User $id exists. Web folder: /home/$id/public"
@@ -1853,7 +2304,7 @@ show_status() {
     echo; echo "Gateway mode: $(batctl gw_mode 2>/dev/null)"
     echo; echo "Mesh neighbours (batctl o):"; batctl o 2>/dev/null | tail -n +2 | head -20
     echo; echo "Gateways (batctl gwl):"; batctl gwl 2>/dev/null
-    echo; echo "Map data (alfred: $(systemctl is-active mesh-alfred 2>/dev/null), batadv-vis: $(systemctl is-active mesh-vis 2>/dev/null)):"; show_map_data
+    echo; echo "Map data (alfred: $(systemctl is-active mesh-alfred 2>/dev/null), batadv-vis: $(systemctl is-active mesh-vis 2>/dev/null), mesh-map: $(systemctl is-active mesh-map 2>/dev/null)):"; show_map_data
     echo; echo "Peers (/etc/hosts.mesh, this Pi only):"; cat /etc/hosts.mesh 2>/dev/null
     echo; echo "Upstream DNS:"; cat /run/dnsmasq/upstream.conf 2>/dev/null
     if [ -s "$WARN_FILE" ]; then echo; echo "Warnings:"; sed 's/^/  /' "$WARN_FILE"; fi

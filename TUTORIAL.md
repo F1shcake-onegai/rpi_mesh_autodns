@@ -287,7 +287,7 @@ ping pi2.mesh          # or just "ping pi2"; works on the Pis, not on laptops
 
 Anyone on the open mesh can announce this service, so only names that are valid IDs
 (`[a-z0-9]+`) with an IPv4 address (four numbers, none above 255) and a MAC of six hex pairs
-are taken; that keeps junk and markup out of `/etc/hosts` and the directory page.
+are taken; that keeps junk and markup out of `/etc/hosts`.
 The script runs this every minute; by hand you run it whenever a Pi joins or leaves.
 
 ## 8. The web folder
@@ -495,7 +495,7 @@ sudo pkill -HUP -x dnsmasq                          # dnsmasq now forwards to th
 | 3 | `menu_identity` (1 Identity); cell ID before `mesh-up.sh` step 0, address in step 4 |
 | 4 to 6 | `mesh-up.sh` steps 3 and 4, run by `mesh.service` |
 | 7 | templates in `/etc/mesh`, `mesh-hosts.sh` on a one-minute timer, the NetworkManager dispatcher `50-mesh-dns` |
-| 8 | the Caddyfile and `/etc/default/mesh`, started by `mesh-up.sh` step 5 |
+| 8 | the Caddyfile and `/etc/default/mesh`, started by `mesh-up.sh` step 5; the script's directory page is the index page (`/var/www/mesh/index.html`, data from `mesh-map.sh`) |
 | 9a | `mesh-role.sh` every two minutes and on every NetworkManager event |
 | 9b | `mesh-uplink.sh` from `mesh-uplink@IFACE.service`, started by udev when the radio is plugged in |
 | 10 | `mesh-down.sh`, run as `ExecStopPost` so it also runs when a start failed half way; it also puts the original hostname and avahi settings back, and `mesh-restore.service` runs that part again at every boot (`mesh-down.sh restore`, before avahi and the mesh) in case the mesh was on at a power cut |

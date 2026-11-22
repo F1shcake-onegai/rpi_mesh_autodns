@@ -1,5 +1,38 @@
 # Changelog
 
+## 20261122+02
+
+The index page. Built and tested on a laptop with generated data and one real two-Pi
+`batadv-vis` output; not yet run on a Pi.
+
+### Added
+- Index page at `http://<group>.mesh/`, headed `<group>.mesh - Live Node Index`: the Pis
+  that are online, as a list on the left (two per line, `@<display name>` over the MAC) and a
+  map on the right (a dot per Pi with the same two lines). A click opens that Pi's page
+  (`/<id>/`). A Pi without a display name shows as `@<id>`.
+- Map layout: the Pi serving the page on the left ("you are here"), Pis with internet or a
+  Wi-Fi access point on the right with an `internet` or `wifi` tag, the others in between,
+  further right the more hops away. A line joins two Pis that hear each other directly; only
+  each Pi's three best links are drawn.
+- The page updates by itself: a Pi that joins drops in, a Pi that leaves fades out with its
+  lines, the others keep their places. `Map not updating` shows after 30 seconds without new
+  data, `No other Pis found yet` when this Pi is alone.
+- `mesh-map.sh` (`mesh-map.service`, while the mesh is on): every 10 seconds it announces this
+  Pi's ID, MAC, display name and roles through alfred, and writes
+  `/var/www/mesh/_mesh/map.json` from every Pi's announcement, `batadv-vis` and `batctl o`.
+  A Pi not heard of for 15 seconds is left out. Everything read from the mesh is checked
+  before it goes into the file.
+- Fonts Space Grotesk and Space Mono (`fonts/`, SIL Open Font License), installed to
+  `/var/www/mesh/_mesh/fonts`; from GitHub when install runs without the folder next to it.
+  Without them the page uses the device's own fonts.
+
+### Changed
+- 1 Identity: the display name takes letters, digits, spaces and `. _ -` only, at most 24
+  characters; anything else is asked again. A stored name with other characters is not shown
+  on the index page (the ID is shown instead) until it is changed.
+- `mesh-hosts.sh` no longer writes `/var/www/mesh/index.html`; install writes the page.
+- Status (8) shows whether `mesh-map` is running.
+
 ## 20261122+01
 
 First step towards the map on the index page: the data source only. Nothing shows it in

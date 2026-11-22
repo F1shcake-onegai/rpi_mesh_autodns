@@ -11,6 +11,10 @@ The access point runs on 5 GHz when the second radio can, else on 2.4 GHz away f
 channel; a radio without access point mode is not offered the role. Status (8) shows what each
 second radio can do.
 
+`http://<group>.mesh/` is the live node index: a list and a map of the Pis that are online,
+each shown as `@<display name>` with its MAC address. Click one to open its page. The map
+updates by itself.
+
 ## Quick start
 
 ```bash
